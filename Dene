@@ -1,155 +1,103 @@
-
 // -----------------------------------------------------------------------------
-// tmp117_controller.v
-// TMP117 kontrolcüsü + i2c_master entegrasyonu
+// tmp117_uart_top.v
+// Top–level: TMP117 kontrolcüsü + I²C master + UART TX entegrasyonu
 // -----------------------------------------------------------------------------
-module tmp117_controller #(
-  parameter SYS_CLK_FREQ     = 100_000_000,  // 100 MHz
-  parameter I2C_BUS_CLK_FREQ =   400_000     // 400 kHz
-)(
-  input  wire        clk_i,        // sistem clock
-  input  wire        rst_al_i,     // aktif düşük reset
-  // 1 Hz’de güncellenen 16 bit ham sıcaklık ve valid flag
-  output reg  [15:0] temp_raw_o,
-  output reg         valid_o,
-  // I²C fiziksel sinyalleri (master ile paylaşılan)
-  inout  wire        sda_io,
-  inout  wire        scl_io
+module tmp117_uart_top (
+    input  wire        clk_i,       // 100 MHz sistem clock
+    input  wire        rst_al_i,    // asenkron, aktif düşük reset
+    inout  wire        sda_io,      // I²C data (open-drain)
+    inout  wire        scl_io,      // I²C clock (open-drain)
+    output wire        tx_o         // UART TX çıktı
 );
 
   // ------------------------------------------------------------
-  //  I2C master ile controller arasındaki sinyaller
+  // 1) TMP117 controller + I²C master instantiation
   // ------------------------------------------------------------
-  reg   en_i;                   // işlem başlat pulse’u
-  reg  [6:0] addr_i;            // 7-bit slave adres
-  reg   rw_i;                   // 0 = write, 1 = read
-  reg  [7:0] data_wr_i;         // write data
-  wire       busy_o;            // master meşgul flag
-  wire [7:0] data_rd_o;         // read data
-  wire       ack_error_o;       // ACK hatası
+  wire [15:0] temp_raw;
+  wire        valid;
 
-  // ------------------------------------------------------------
-  // i2c_master instantiation
-  // ------------------------------------------------------------
-  i2c_master #(
-    .DATA_WIDTH      (8),
-    .SYS_CLK_FREQ    (SYS_CLK_FREQ),
-    .I2C_BUS_CLK_FREQ(I2C_BUS_CLK_FREQ)
-  ) u_i2c_master (
-    .clk_i        (clk_i),
-    .rst_ali      (rst_al_i),
-    .en_i         (en_i),
-    .addr_i       (addr_i),
-    .rw_i         (rw_i),
-    .data_wr_i    (data_wr_i),
-    .busy_o       (busy_o),
-    .data_rd_o    (data_rd_o),
-    .ack_error_o  (ack_error_o),
-    .sda_io       (sda_io),
-    .scl_io       (scl_io)
+  tmp117_controller u_tmp117 (
+      .clk_i      (clk_i),
+      .rst_al_i   (rst_al_i),
+      .temp_raw_o (temp_raw),
+      .valid_o    (valid),
+      .sda_io     (sda_io),
+      .scl_io     (scl_io)
   );
 
   // ------------------------------------------------------------
-  // Sabitler ve 1 Hz sayaç
+  // 2) UART TX instantiation
   // ------------------------------------------------------------
-  localparam DEV_ADDR = 7'h48;
-  localparam REG_TEMP = 8'h00;
-  localparam PERIOD   = SYS_CLK_FREQ;
+  wire        tx_busy_o;
+  wire        tx_done_o;
+  reg  [7:0]  tx_data_i;
+  reg         tx_start_i;
 
-  reg [26:0] sec_cnt;
-  reg        tick_1hz;
+  uart_tx #(
+      .CLK_FREQ   (100_000_000),  // sistem clock
+      .BAUDRATE   (921600),       // baud rate
+      .DATA_WIDTH (8),
+      .STOP_BIT   (1)
+  ) u_uart_tx (
+      .clk_i       (clk_i),
+      .rst_al_i    (rst_al_i),
+      .tx_data_i   (tx_data_i),
+      .tx_start_i  (tx_start_i),
+      .tx_busy_o   (tx_busy_o),
+      .tx_done_o   (tx_done_o),
+      .tx_o        (tx_o)
+  );
+
+  // ------------------------------------------------------------
+  // 3) Sıcaklığı MSB/LSB olarak UART’a yollayan FSM
+  // ------------------------------------------------------------
+  typedef enum logic [1:0] {
+    TX_IDLE   = 2'd0,
+    TX_MSB    = 2'd1,
+    TX_LSB    = 2'd2
+  } tx_state_t;
+
+  tx_state_t  tx_state;
+  
   always @(posedge clk_i or negedge rst_al_i) begin
     if (!rst_al_i) begin
-      sec_cnt  <= 0;
-      tick_1hz <= 0;
-    end else if (sec_cnt == PERIOD-1) begin
-      sec_cnt  <= 0;
-      tick_1hz <= 1;
+      tx_state    <= TX_IDLE;
+      tx_start_i  <= 1'b0;
+      tx_data_i   <= 8'd0;
     end else begin
-      sec_cnt  <= sec_cnt + 1;
-      tick_1hz <= 0;
-    end
-  end
+      // her clock başında pulse’ı temizle
+      tx_start_i <= 1'b0;
 
-  // ------------------------------------------------------------
-  // FSM durumları
-  // ------------------------------------------------------------
-  localparam
-    IDLE      = 3'd0,
-    WRITE_PTR = 3'd1,
-    WAIT_WR   = 3'd2,
-    READ_MSB  = 3'd3,
-    WAIT_MSB  = 3'd4,
-    READ_LSB  = 3'd5,
-    WAIT_LSB  = 3'd6,
-    DONE      = 3'd7;
-
-  reg [2:0]  state;
-  reg [15:0] temp_buf;
-
-  always @(posedge clk_i or negedge rst_al_i) begin
-    if (!rst_al_i) begin
-      // reset
-      state      <= IDLE;
-      en_i       <= 1'b0;
-      addr_i     <= DEV_ADDR;
-      rw_i       <= 1'b0;
-      data_wr_i  <= 8'd0;
-      temp_raw_o <= 16'd0;
-      valid_o    <= 1'b0;
-      temp_buf   <= 16'd0;
-    end else begin
-      // default temizleme
-      en_i    <= 1'b0;
-      valid_o <= 1'b0;
-
-      case (state)
-        IDLE: if (tick_1hz) begin
-          // pointer = 0x00 yaz
-          en_i      <= 1'b1;
-          rw_i      <= 1'b0;
-          addr_i    <= DEV_ADDR;
-          data_wr_i <= REG_TEMP;
-          state     <= WRITE_PTR;
+      case (tx_state)
+        //----------------------------------------
+        TX_IDLE: begin
+          // yeni veri geldiğinde ve UART boşsa önce MSB’i yolla
+          if (valid && !tx_busy_o) begin
+            tx_data_i  <= temp_raw[15:8];
+            tx_start_i <= 1'b1;
+            tx_state   <= TX_MSB;
+          end
         end
 
-        WRITE_PTR: if (busy_o) begin
-          state <= WAIT_WR;
+        //----------------------------------------
+        TX_MSB: begin
+          // MSB gönderimi tamamlandığında
+          if (tx_done_o) begin
+            tx_data_i  <= temp_raw[7:0];
+            tx_start_i <= 1'b1;
+            tx_state   <= TX_LSB;
+          end
         end
 
-        WAIT_WR: if (!busy_o) begin
-          // MSB oku
-          en_i   <= 1'b1;
-          rw_i   <= 1'b1;
-          state  <= READ_MSB;
+        //----------------------------------------
+        TX_LSB: begin
+          // LSB gönderimi tamamlandığında
+          if (tx_done_o) begin
+            tx_state   <= TX_IDLE;
+          end
         end
 
-        READ_MSB: if (busy_o) begin
-          state <= WAIT_MSB;
-        end
-
-        WAIT_MSB: if (!busy_o) begin
-          temp_buf[15:8] <= data_rd_o;
-          // LSB oku
-          en_i   <= 1'b1;
-          rw_i   <= 1'b1;
-          state  <= READ_LSB;
-        end
-
-        READ_LSB: if (busy_o) begin
-          state <= WAIT_LSB;
-        end
-
-        WAIT_LSB: if (!busy_o) begin
-          temp_buf[7:0] <= data_rd_o;
-          temp_raw_o    <= temp_buf;
-          valid_o       <= 1'b1;
-          state         <= DONE;
-        end
-
-        DONE: state <= IDLE;
-
-        default: state <= IDLE;
+        default: tx_state <= TX_IDLE;
       endcase
     end
   end
