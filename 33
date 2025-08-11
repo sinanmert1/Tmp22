@@ -637,3 +637,57 @@ module tmp117_uart_top
     end
 
 endmodule
+
+*smoke
+module i2c_smoke
+#(
+    parameter SYS_CLK = 100_000_000,
+    parameter I2C_CLK =     100_000
+)
+(
+    input  clk_i,
+    input  rst_al_i,
+    inout  sda_io,
+    inout  scl_io,
+    output led_busy_o,
+    output led_done_o
+);
+    // 10 ms'de bir start pulse
+    reg [20:0] cnt_r;
+    wire tick_w = (cnt_r == (SYS_CLK/100)-1); // 10 ms
+    always @(posedge clk_i or negedge rst_al_i)
+        if(!rst_al_i) cnt_r <= 21'd0;
+        else if (tick_w) cnt_r <= 21'd0;
+        else cnt_r <= cnt_r + 21'd1;
+
+    reg start_r;
+    always @(posedge clk_i or negedge rst_al_i)
+        if(!rst_al_i) start_r <= 1'b0;
+        else          start_r <= tick_w; // 1-clk pulse
+
+    wire busy_w, done_w, ackerr_w, rd_valid_w;
+    wire [7:0] rd_data_w;
+
+    i2c_master #(
+        .SYS_CLK_FREQ(SYS_CLK),
+        .I2C_CLK_FREQ(I2C_CLK)
+    ) u_i2c (
+        .clk_i     (clk_i),
+        .rst_al_i  (rst_al_i),
+        .start_i   (start_r),
+        .rw_i      (1'b0),          // write
+        .addr_i    (7'h48),         // TMP117 addr
+        .wr_data_i (8'h00),         // pointer
+        .rd_len_i  (8'd0),          // yazmada kullanılmaz
+        .busy_o    (busy_w),
+        .done_o    (done_w),
+        .ack_err_o (ackerr_w),
+        .rd_data_o (rd_data_w),
+        .rd_valid_o(rd_valid_w),
+        .sda_io    (sda_io),
+        .scl_io    (scl_io)
+    );
+
+    assign led_busy_o = busy_w;
+    assign led_done_o = done_w;
+endmodule 
