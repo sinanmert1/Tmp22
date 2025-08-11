@@ -691,3 +691,239 @@ module i2c_smoke
     assign led_busy_o = busy_w;
     assign led_done_o = done_w;
 endmodule 
+
+#
+
+// i2c_master.v — Verilog-2001, open-drain I2C master (1B write + NB read)
+// START/STOP SCL=HIGH iken SDA değişimine izin verir (kritik düzeltme)
+module i2c_master
+#(
+    parameter SYS_CLK_FREQ = 100_000_000,
+    parameter I2C_CLK_FREQ =     100_000
+)
+(
+    input  clk_i,
+    input  rst_al_i,
+
+    input  start_i,            // 1-clk pulse
+    input  rw_i,               // 0=write(1B), 1=read(NB)
+    input  [6:0] addr_i,
+    input  [7:0] wr_data_i,
+    input  [7:0] rd_len_i,     // 1..255
+
+    output busy_o,
+    output done_o,
+    output ack_err_o,
+    output [7:0] rd_data_o,
+    output rd_valid_o,
+
+    inout  sda_io,
+    inout  scl_io
+);
+
+    // -------- 4-faz clock: ph=0/1: SCL LOW, ph=2/3: SCL HIGH --------
+    localparam PH_TICKS = SYS_CLK_FREQ / (I2C_CLK_FREQ * 4);
+    reg [15:0] ph_cnt_r;
+    reg [1:0]  ph_r;
+    wire       ph_tick_w = (ph_cnt_r == PH_TICKS-1);
+
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            ph_cnt_r <= 16'd0;
+            ph_r     <= 2'd0;
+        end else begin
+            if (ph_tick_w) begin
+                ph_cnt_r <= 16'd0;
+                ph_r     <= ph_r + 2'd1;
+            end else begin
+                ph_cnt_r <= ph_cnt_r + 16'd1;
+            end
+        end
+    end
+
+    // -------- Open-drain hat sürüşü --------
+    reg scl_oe_r;      // 1→LOW sür, 0→Z (pull-up ile HIGH)
+    reg sda_oe_r;      // 1→LOW sür, 0→Z
+
+    assign scl_io = (scl_oe_r == 1'b1) ? 1'b0 : 1'bz;
+    assign sda_io = (sda_oe_r == 1'b1) ? 1'b0 : 1'bz;
+
+    // SCL: low fazlarda LOW sür, high fazlarda release
+    always @(*) begin
+        scl_oe_r = (ph_r[1] == 1'b0);
+    end
+
+    // -------- Durumlar --------
+    localparam S_IDLE   = 4'd0,
+               S_STRT_W = 4'd1,   // START oluştur (SCL HIGH iken SDA LOW)
+               S_ADDR   = 4'd2,   // 7b addr + R/W
+               S_ACK1   = 4'd3,   // addr ACK
+               S_WBYTE  = 4'd4,   // write data
+               S_WACK   = 4'd5,   // write ACK
+               S_RBYTE  = 4'd6,   // read data
+               S_RACK   = 4'd7,   // master ACK/NACK
+               S_STOP   = 4'd8,   // STOP (SCL HIGH iken SDA LOW->HIGH)
+               S_DONE   = 4'd9;
+
+    reg [3:0] state_r;
+    reg [2:0] bitcnt_r;
+    reg [7:0] shifter_r;
+    reg [7:0] rd_data_r;
+    reg [7:0] rd_left_r;
+    reg       busy_r, done_r, ack_err_r, rd_valid_r;
+    reg       start_ff_r;
+
+    assign busy_o     = busy_r;
+    assign done_o     = done_r;
+    assign ack_err_o  = ack_err_r;
+    assign rd_data_o  = rd_data_r;
+    assign rd_valid_o = rd_valid_r;
+
+    wire start_pulse_w = start_i & ~start_ff_r;
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) start_ff_r <= 1'b0;
+        else           start_ff_r <= start_i;
+    end
+
+    // -------- Ana FSM --------
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            state_r   <= S_IDLE;
+            bitcnt_r  <= 3'd0;
+            shifter_r <= 8'h00;
+            rd_data_r <= 8'h00;
+            rd_left_r <= 8'd0;
+            busy_r    <= 1'b0;
+            done_r    <= 1'b0;
+            ack_err_r <= 1'b0;
+            rd_valid_r<= 1'b0;
+            sda_oe_r  <= 1'b0;   // release
+        end else begin
+            // varsayılanlar
+            done_r     <= 1'b0;
+            rd_valid_r <= 1'b0;
+
+            if (ph_tick_w) begin
+                case (state_r)
+                    // ------------------------------------------------
+                    S_IDLE: begin
+                        sda_oe_r <= 1'b0; // release
+                        if (start_pulse_w && !busy_r) begin
+                            busy_r    <= 1'b1;
+                            ack_err_r <= 1'b0;
+                            shifter_r <= {addr_i, rw_i};
+                            bitcnt_r  <= 3'd7;
+                            state_r   <= S_STRT_W;
+                        end
+                    end
+                    // ------------------------------------------------
+                    S_STRT_W: begin
+                        // START: SCL HIGH iken SDA LOW yap
+                        if (ph_r[1] == 1'b1) sda_oe_r <= 1'b1;  // SDA=LOW
+                        // Bir HIGH fazını gördükten sonra adrese geç
+                        if (ph_r == 2'd3) state_r <= S_ADDR;
+                    end
+                    // ------------------------------------------------
+                    S_ADDR: begin
+                        // Bit değeri SCL LOW fazında hazırlanır
+                        if (ph_r == 2'd0) begin
+                            // bit=0 ise LOW sür; bit=1 ise release
+                            sda_oe_r <= (shifter_r[7] == 1'b0) ? 1'b1 : 1'b0;
+                        end
+                        // LOW faz sonunda bir sonraki bite ilerle
+                        if (ph_r == 2'd1) begin
+                            if (bitcnt_r == 3'd0) begin
+                                // ACK için SDA release (slave sürer)
+                                sda_oe_r <= 1'b0;
+                                state_r  <= S_ACK1;
+                            end else begin
+                                shifter_r <= {shifter_r[6:0],1'b0};
+                                bitcnt_r  <= bitcnt_r - 3'd1;
+                            end
+                        end
+                    end
+                    // ------------------------------------------------
+                    S_ACK1: begin
+                        // ACK’i SCL HIGH fazında oku
+                        if (ph_r == 2'd3) begin
+                            ack_err_r <= sda_io; // 0=ACK, 1=NACK
+                            if (rw_i == 1'b0) begin
+                                shifter_r <= wr_data_i; bitcnt_r <= 3'd7;
+                                state_r   <= S_WBYTE;
+                            end else begin
+                                bitcnt_r  <= 3'd7;
+                                rd_left_r <= (rd_len_i == 8'd0) ? 8'd1 : rd_len_i;
+                                state_r   <= S_RBYTE;
+                            end
+                        end
+                    end
+                    // ------------------------------------------------
+                    S_WBYTE: begin
+                        if (ph_r == 2'd0) begin
+                            sda_oe_r <= (shifter_r[7] == 1'b0) ? 1'b1 : 1'b0;
+                        end
+                        if (ph_r == 2'd1) begin
+                            if (bitcnt_r == 3'd0) begin
+                                sda_oe_r <= 1'b0;  // release → ACK zamanı
+                                state_r  <= S_WACK;
+                            end else begin
+                                shifter_r <= {shifter_r[6:0],1'b0};
+                                bitcnt_r  <= bitcnt_r - 3'd1;
+                            end
+                        end
+                    end
+                    S_WACK: begin
+                        if (ph_r == 2'd3) begin
+                            ack_err_r <= ack_err_r | sda_io;
+                            state_r   <= S_STOP;
+                        end
+                    end
+                    // ------------------------------------------------
+                    S_RBYTE: begin
+                        // Okuma: SDA hep release; SCL HIGH’da örnekle
+                        sda_oe_r <= 1'b0;
+                        if (ph_r == 2'd3) begin
+                            rd_data_r[bitcnt_r] <= sda_io;
+                            if (bitcnt_r == 3'd0) begin
+                                rd_valid_r <= 1'b1;
+                                state_r    <= S_RACK;
+                            end
+                        end else if (ph_r == 2'd1) begin
+                            if (bitcnt_r != 3'd0) bitcnt_r <= bitcnt_r - 3'd1;
+                        end
+                    end
+                    S_RACK: begin
+                        // Devam edecekse ACK (LOW), son ise NACK (release)
+                        if (ph_r == 2'd0) begin
+                            if (rd_left_r > 8'd1) sda_oe_r <= 1'b1; else sda_oe_r <= 1'b0;
+                        end
+                        if (ph_r == 2'd3) begin
+                            if (rd_left_r > 8'd1) begin
+                                rd_left_r <= rd_left_r - 8'd1;
+                                bitcnt_r  <= 3'd7;
+                                state_r   <= S_RBYTE;
+                            end else begin
+                                state_r   <= S_STOP;
+                            end
+                        end
+                    end
+                    // ------------------------------------------------
+                    S_STOP: begin
+                        // STOP: SCL HIGH iken SDA LOW→HIGH
+                        // Önce SCL LOW fazında SDA’yı LOW yap, sonra HIGH fazında release
+                        if (ph_r[1] == 1'b0) sda_oe_r <= 1'b1; else sda_oe_r <= 1'b0;
+                        if (ph_r == 2'd3) state_r <= S_DONE;
+                    end
+
+                    S_DONE: begin
+                        busy_r <= 1'b0;
+                        done_r <= 1'b1;
+                        state_r<= S_IDLE;
+                    end
+
+                    default: state_r <= S_IDLE;
+                endcase
+            end
+        end
+    end
+endmodule 
