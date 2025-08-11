@@ -1,0 +1,639 @@
+// ============================================================================
+// i2c_master.v — Bit-level I2C master (open-drain), 1B write + N-byte read
+// - SYS_CLK_FREQ : system clock (Hz)
+// - I2C_CLK_FREQ : I2C bus clock (Hz) — 100k/400k önerilir
+// Arayüz:
+//   start_i   : 1 clk pulse → işlemi başlatır
+//   rw_i      : 0=write(1 byte), 1=read(N bytes)
+//   addr_i    : 7-bit slave address (TMP117 için 7'h48)
+//   wr_data_i : write modunda gönderilecek tek byte
+//   rd_len_i  : read modunda okunacak byte sayısı (1..255)
+//   busy_o    : işlem boyunca 1
+//   done_o    : işlem bitiminde 1 clk pulse
+//   ack_err_o : herhangi bir ACK beklemesinde NACK görülürse 1
+//   rd_data_o : read sırasında alınan byte
+//   rd_valid_o: rd_data_o geçerli olduğunda 1 clk pulse
+// I/O:
+//   sda_io, scl_io : open-drain (harici pull-up gerekli)
+// ============================================================================
+module i2c_master
+#(
+    parameter integer SYS_CLK_FREQ = 100_000_000,
+    parameter integer I2C_CLK_FREQ =     100_000
+)
+(
+    input  clk_i,
+    input  rst_al_i,
+
+    input  start_i,
+    input  rw_i,
+    input  [6:0] addr_i,
+    input  [7:0] wr_data_i,
+    input  [7:0] rd_len_i,
+
+    output busy_o,
+    output done_o,
+    output ack_err_o,
+    output [7:0] rd_data_o,
+    output rd_valid_o,
+
+    inout  sda_io,
+    inout  scl_io
+);
+
+    // ---------------- Clock phase (4 faz/scl): 0..3 ----------------
+    localparam integer PH_TICKS = SYS_CLK_FREQ / (I2C_CLK_FREQ * 4);
+    reg [$clog2(PH_TICKS)-1:0] ph_cnt_r;
+    reg [1:0]                  ph_r;
+    wire                       ph_tick_w = (ph_cnt_r == PH_TICKS-1);
+
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            ph_cnt_r <= {($clog2(PH_TICKS)){1'b0}};
+            ph_r     <= 2'd0;
+        end else begin
+            if (ph_tick_w) begin
+                ph_cnt_r <= {($clog2(PH_TICKS)){1'b0}};
+                ph_r     <= ph_r + 2'd1;
+            end else begin
+                ph_cnt_r <= ph_cnt_r + {{($clog2(PH_TICKS)-1){1'b0}},1'b1};
+            end
+        end
+    end
+
+    // ---------------- Open-drain sürüş (SCL/SDA) -------------------
+    // SCL: low fazlarda 0 sür, high fazlarda Z bırak → harici pull-up ile HIGH
+    reg scl_oe_r;   // 1 => LOW sür, 0 => Z
+    reg sda_oe_r;   // 1 => LOW sür, 0 => Z
+
+    assign scl_io = (scl_oe_r == 1'b1) ? 1'b0 : 1'bz;
+    assign sda_io = (sda_oe_r == 1'b1) ? 1'b0 : 1'bz;
+
+    always @(*) begin
+        scl_oe_r = (ph_r[1] == 1'b0);  // ph=0/1 low; ph=2/3 high
+    end
+
+    // ---------------- FSM & veri yolları ---------------------------
+    localparam [3:0]
+        S_IDLE  = 4'd0,
+        S_START = 4'd1,
+        S_ADDR  = 4'd2,
+        S_ACK1  = 4'd3,
+        S_WBYTE = 4'd4,
+        S_WACK  = 4'd5,
+        S_RBYTE = 4'd6,
+        S_RACK  = 4'd7,
+        S_STOP  = 4'd8,
+        S_DONE  = 4'd9;
+
+    reg  [3:0] state_r;
+    reg  [2:0] bitcnt_r;            // 7..0
+    reg  [7:0] shifter_r;
+    reg  [7:0] rd_data_r;
+    reg  [7:0] rd_left_r;
+    reg        busy_r, done_r, ack_err_r, rd_valid_r;
+    reg        start_ff_r;
+
+    assign busy_o     = busy_r;
+    assign done_o     = done_r;
+    assign ack_err_o  = ack_err_r;
+    assign rd_data_o  = rd_data_r;
+    assign rd_valid_o = rd_valid_r;
+
+    wire start_pulse_w = start_i & ~start_ff_r;
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) start_ff_r <= 1'b0;
+        else           start_ff_r <= start_i;
+    end
+
+    // SDA sürüş kararı (komb): “0” göndermek/ACK basmak gerektiğinde LOW sür
+    reg sda_drive_low_c;
+
+    always @(*) begin
+        sda_oe_r = ( (ph_r[1] == 1'b0) && (sda_drive_low_c == 1'b1) ) ? 1'b1 : 1'b0;
+    end
+
+    // ---------------- Ana FSM (sadece ph_tick’te ilerler) ----------
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            state_r        <= S_IDLE;
+            bitcnt_r       <= 3'd0;
+            shifter_r      <= 8'h00;
+            rd_data_r      <= 8'h00;
+            rd_left_r      <= 8'd0;
+            busy_r         <= 1'b0;
+            done_r         <= 1'b0;
+            ack_err_r      <= 1'b0;
+            rd_valid_r     <= 1'b0;
+            sda_drive_low_c<= 1'b0;
+        end else begin
+            // defaultlar (clk başına)
+            done_r     <= 1'b0;
+            rd_valid_r <= 1'b0;
+            sda_drive_low_c <= 1'b0;
+
+            if (ph_tick_w) begin
+                case (state_r)
+                    // ------------------------------------------------
+                    S_IDLE: begin
+                        if (start_pulse_w && !busy_r) begin
+                            busy_r    <= 1'b1;
+                            ack_err_r <= 1'b0;
+                            shifter_r <= {addr_i, rw_i}; // 7b addr + R/W
+                            bitcnt_r  <= 3'd7;
+                            // START: SCL high (ph=2/3) iken SDA’yı LOW yapmak için
+                            // bir periyot boyunca LOW sürmeye hazırlan.
+                            sda_drive_low_c <= 1'b1;
+                            state_r   <= S_START;
+                        end
+                    end
+                    // ------------------------------------------------
+                    S_START: begin
+                        // START sonrası ADDRESS bitlerini gönder
+                        // bit=0 → LOW sür; bit=1 → Z (pull-up’la HIGH)
+                        sda_drive_low_c <= (shifter_r[7] == 1'b0);
+                        if (ph_r == 2'd1) begin
+                            // low faz biterken bir sonraki bite hazırlık
+                            if (bitcnt_r == 3'd0) begin
+                                state_r <= S_ACK1; // ACK bekleme
+                            end else begin
+                                shifter_r <= {shifter_r[6:0],1'b0};
+                                bitcnt_r  <= bitcnt_r - 3'd1;
+                            end
+                        end
+                    end
+                    // ------------------------------------------------
+                    S_ACK1: begin
+                        // ACK aşaması: SDA release (Z), SCL high iken oku
+                        // comb’da sda_drive_low_c=0 (release)
+                        if (ph_r == 2'd3) begin
+                            ack_err_r <= sda_io; // 0=ACK, 1=NACK
+                            if (rw_i == 1'b0) begin
+                                // WRITE: tek byte yolla
+                                shifter_r <= wr_data_i;
+                                bitcnt_r  <= 3'd7;
+                                state_r   <= S_WBYTE;
+                            end else begin
+                                // READ: çok byte
+                                bitcnt_r  <= 3'd7;
+                                rd_left_r <= (rd_len_i == 8'd0) ? 8'd1 : rd_len_i;
+                                state_r   <= S_RBYTE;
+                            end
+                        end
+                    end
+                    // ------------------------------------------------
+                    S_WBYTE: begin
+                        sda_drive_low_c <= (shifter_r[7] == 1'b0);
+                        if (ph_r == 2'd1) begin
+                            if (bitcnt_r == 3'd0) begin
+                                state_r <= S_WACK; // ACK bekle
+                            end else begin
+                                shifter_r <= {shifter_r[6:0],1'b0};
+                                bitcnt_r  <= bitcnt_r - 3'd1;
+                            end
+                        end
+                    end
+                    S_WACK: begin
+                        // release; high fazda oku
+                        if (ph_r == 2'd3) begin
+                            ack_err_r <= ack_err_r | sda_io;
+                            state_r   <= S_STOP;
+                        end
+                    end
+                    // ------------------------------------------------
+                    S_RBYTE: begin
+                        // Okuma: SDA release; SCL high fazında bit örnekle
+                        if (ph_r == 2'd3) begin
+                            shifter_r[bitcnt_r] <= sda_io;
+                            if (bitcnt_r == 3'd0) begin
+                                rd_data_r  <= shifter_r;
+                                rd_valid_r <= 1'b1;
+                                state_r    <= S_RACK;
+                            end
+                        end else if (ph_r == 2'd1) begin
+                            if (bitcnt_r != 3'd0) bitcnt_r <= bitcnt_r - 3'd1;
+                        end
+                    end
+                    S_RACK: begin
+                        // Devam varsa ACK(LOW), son ise NACK(release)
+                        if (rd_left_r > 8'd1) begin
+                            sda_drive_low_c <= 1'b1; // ACK bitini LOW sür
+                        end else begin
+                            sda_drive_low_c <= 1'b0; // NACK: release
+                        end
+                        if (ph_r == 2'd3) begin
+                            if (rd_left_r > 8'd1) begin
+                                rd_left_r <= rd_left_r - 8'd1;
+                                bitcnt_r  <= 3'd7;
+                                state_r   <= S_RBYTE;
+                            end else begin
+                                state_r   <= S_STOP;
+                            end
+                        end
+                    end
+                    // ------------------------------------------------
+                    S_STOP: begin
+                        // STOP: SCL high iken SDA 0→1
+                        // low fazda SDA=0 tut, high fazda release
+                        if (ph_r[1] == 1'b0) sda_drive_low_c <= 1'b1; else sda_drive_low_c <= 1'b0;
+                        if (ph_r == 2'd3) begin
+                            state_r <= S_DONE;
+                        end
+                    end
+
+                    S_DONE: begin
+                        busy_r <= 1'b0;
+                        done_r <= 1'b1;
+                        state_r<= S_IDLE;
+                    end
+
+                    default: state_r <= S_IDLE;
+                endcase
+            end
+        end
+    end
+
+endmodule
+
+~
+// ============================================================================
+// tmp117_controller.v — TMP117 (7.6 Register Map) sıcaklık okuma denetleyici
+// Akış:
+//  1) START + (addr|W) + 0x00(pointer=Temp) + STOP
+//  2) START + (addr|R) ile 2 byte oku: MSB(ACK), LSB(NACK) + STOP
+// Çıkışlar:
+//   temp_raw_o   : {MSB,LSB}  — iki’sinin tümleyen işaretli 16-bit
+//   data_valid_o : 1 clk pulse (temp_raw_o güncellendiğinde)
+//   ack_error_o  : herhangi bir aşamada NACK görülürse 1
+// ============================================================================
+module tmp117_controller
+#(
+    parameter integer CLK_FREQ_HZ  = 100_000_000,
+    parameter integer I2C_FREQ_HZ  =     100_000,
+    parameter [6:0]  DEV_ADDR_7BIT = 7'h48
+)
+(
+    input  clk_i,
+    input  rst_al_i,
+
+    input  start_i,           // 1 clk pulse → bir ölçüm oku
+
+    inout  sda_io,
+    inout  scl_io,
+
+    output data_valid_o,
+    output [15:0] temp_raw_o,
+    output ack_error_o
+);
+
+    // -------- I2C master instance --------
+    wire        m_busy_w, m_done_w, m_ack_w, m_rv_w;
+    wire [7:0]  m_rd_w;
+    reg         m_start_r, m_rw_r;
+    reg  [6:0]  m_addr_r;
+    reg  [7:0]  m_wdata_r, m_rdlen_r;
+
+    i2c_master #(
+        .SYS_CLK_FREQ (CLK_FREQ_HZ),
+        .I2C_CLK_FREQ (I2C_FREQ_HZ)
+    ) u_i2c (
+        .clk_i      (clk_i),
+        .rst_al_i   (rst_al_i),
+        .start_i    (m_start_r),
+        .rw_i       (m_rw_r),
+        .addr_i     (m_addr_r),
+        .wr_data_i  (m_wdata_r),
+        .rd_len_i   (m_rdlen_r),
+        .busy_o     (m_busy_w),
+        .done_o     (m_done_w),
+        .ack_err_o  (m_ack_w),
+        .rd_data_o  (m_rd_w),
+        .rd_valid_o (m_rv_w),
+        .sda_io     (sda_io),
+        .scl_io     (scl_io)
+    );
+
+    // -------- Controller FSM --------
+    localparam [2:0]
+        C_IDLE  = 3'd0,
+        C_WPTR  = 3'd1,
+        C_WWAIT = 3'd2,
+        C_RREQ  = 3'd3,
+        C_RWAIT = 3'd4,
+        C_DONE  = 3'd5;
+
+    reg [2:0]  cs_r;
+    reg [15:0] temp_r;
+    reg        dv_r;
+    reg        ack_or_r;
+    reg        have_msb_r;
+
+    reg        start_ff_r;
+    wire       start_pulse_w = start_i & ~start_ff_r;
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) start_ff_r <= 1'b0;
+        else           start_ff_r <= start_i;
+    end
+
+    assign temp_raw_o   = temp_r;
+    assign data_valid_o = dv_r;
+    assign ack_error_o  = ack_or_r;
+
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            cs_r       <= C_IDLE;
+            m_start_r  <= 1'b0;
+            m_rw_r     <= 1'b0;
+            m_addr_r   <= DEV_ADDR_7BIT;
+            m_wdata_r  <= 8'h00;
+            m_rdlen_r  <= 8'd0;
+            temp_r     <= 16'h0000;
+            dv_r       <= 1'b0;
+            ack_or_r   <= 1'b0;
+            have_msb_r <= 1'b0;
+        end else begin
+            // defaultlar
+            m_start_r <= 1'b0;
+            dv_r      <= 1'b0;
+
+            case (cs_r)
+                C_IDLE: begin
+                    if (start_pulse_w) begin
+                        // 1) pointer = 0x00
+                        m_addr_r  <= DEV_ADDR_7BIT;
+                        m_rw_r    <= 1'b0;        // write
+                        m_wdata_r <= 8'h00;       // pointer=Temperature
+                        m_start_r <= 1'b1;
+                        cs_r      <= C_WWAIT;
+                    end
+                end
+
+                C_WWAIT: begin
+                    if (m_done_w) begin
+                        ack_or_r <= m_ack_w;
+                        // 2) 2 byte read
+                        m_rw_r    <= 1'b1;
+                        m_rdlen_r <= 8'd2;
+                        m_start_r <= 1'b1;
+                        have_msb_r<= 1'b0;
+                        cs_r      <= C_RREQ;
+                    end
+                end
+
+                C_RREQ: begin
+                    // master başlamış olacak; veriler geldikçe topla
+                    cs_r <= C_RWAIT;
+                end
+
+                C_RWAIT: begin
+                    if (m_rv_w) begin
+                        if (!have_msb_r) begin
+                            temp_r[15:8] <= m_rd_w;
+                            have_msb_r   <= 1'b1;
+                        end else begin
+                            temp_r[7:0]  <= m_rd_w;
+                        end
+                    end
+                    if (m_done_w) begin
+                        ack_or_r <= ack_or_r | m_ack_w;
+                        cs_r     <= C_DONE;
+                    end
+                end
+
+                C_DONE: begin
+                    dv_r  <= 1'b1;        // 1 clk pulse
+                    cs_r  <= C_IDLE;
+                end
+
+                default: cs_r <= C_IDLE;
+            endcase
+        end
+    end
+
+endmodule
+
+~
+
+// ============================================================================
+// uart_tx.v — Basit 8N1 verici
+// ============================================================================
+module uart_tx
+#(
+    parameter integer CLK_FREQ_HZ = 100_000_000,
+    parameter integer BAUD        =     115_200
+)
+(
+    input  clk_i,
+    input  rst_al_i,
+
+    input  tx_start_i,         // 1 clk pulse
+    input  [7:0] tx_data_i,
+    output tx_busy_o,
+    output tx_o
+);
+    localparam integer DIV = CLK_FREQ_HZ / BAUD;
+
+    reg        busy_r;
+    reg [3:0]  bitpos_r;       // 0..9 (start + 8 data + stop)
+    reg [7:0]  data_r;
+    reg [15:0] cnt_r;
+    reg        tx_r;
+
+    assign tx_busy_o = busy_r;
+    assign tx_o      = tx_r;
+
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            busy_r  <= 1'b0;
+            bitpos_r<= 4'd0;
+            data_r  <= 8'h00;
+            cnt_r   <= 16'd0;
+            tx_r    <= 1'b1; // idle=1
+        end else begin
+            if (!busy_r) begin
+                if (tx_start_i) begin
+                    busy_r   <= 1'b1;
+                    bitpos_r <= 4'd0;
+                    data_r   <= tx_data_i;
+                    cnt_r    <= 16'd0;
+                    tx_r     <= 1'b0; // start bit
+                end
+            end else begin
+                if (cnt_r == DIV-1) begin
+                    cnt_r <= 16'd0;
+                    bitpos_r <= bitpos_r + 4'd1;
+                    case (bitpos_r)
+                        4'd0:   tx_r <= data_r[0];
+                        4'd1:   tx_r <= data_r[1];
+                        4'd2:   tx_r <= data_r[2];
+                        4'd3:   tx_r <= data_r[3];
+                        4'd4:   tx_r <= data_r[4];
+                        4'd5:   tx_r <= data_r[5];
+                        4'd6:   tx_r <= data_r[6];
+                        4'd7:   tx_r <= data_r[7];
+                        4'd8:   tx_r <= 1'b1;     // stop
+                        4'd9: begin
+                            tx_r   <= 1'b1;       // idle
+                            busy_r <= 1'b0;
+                        end
+                        default: ;
+                    endcase
+                end else begin
+                    cnt_r <= cnt_r + 16'd1;
+                end
+            end
+        end
+    end
+endmodule
+
+~
+
+// ============================================================================
+// tmp117_uart_top.v — TMP117 okur, "±DD.DDD°C\r\n" olarak UART'a basar
+// ============================================================================
+module tmp117_uart_top
+#(
+    parameter integer CLK_FREQ_HZ  = 100_000_000,
+    parameter integer I2C_FREQ_HZ  =     100_000,
+    parameter integer BAUD         =     115_200
+)
+(
+    input  clk_i,
+    input  rst_al_i,
+
+    inout  sda_io,
+    inout  scl_io,
+
+    output uart_tx_o
+);
+    // ---- TMP117 controller ----
+    wire        dv_w;
+    wire [15:0] raw_w;
+    wire        ackerr_w;
+
+    // 1 Hz tetik (her saniye bir ölçüm iste)
+    reg [31:0] sec_cnt_r;
+    wire       kick_w = (sec_cnt_r == CLK_FREQ_HZ-1);
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i)       sec_cnt_r <= 32'd0;
+        else if (kick_w)     sec_cnt_r <= 32'd0;
+        else                 sec_cnt_r <= sec_cnt_r + 32'd1;
+    end
+
+    reg start_req_r;
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) start_req_r <= 1'b0;
+        else            start_req_r <= kick_w;  // 1 clk pulse
+    end
+
+    tmp117_controller #(
+        .CLK_FREQ_HZ (CLK_FREQ_HZ),
+        .I2C_FREQ_HZ (I2C_FREQ_HZ),
+        .DEV_ADDR_7BIT(7'h48)
+    ) u_tmp117 (
+        .clk_i        (clk_i),
+        .rst_al_i     (rst_al_i),
+        .start_i      (start_req_r),
+        .sda_io       (sda_io),
+        .scl_io       (scl_io),
+        .data_valid_o (dv_w),
+        .temp_raw_o   (raw_w),
+        .ack_error_o  (ackerr_w)
+    );
+
+    // ---- raw → milli-°C (signed) ----
+    // TMP117 LSB = 0.0078125 °C = 1/128 °C
+    // mC = raw * 1000 / 128
+    reg signed [31:0] mC_r;
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) mC_r <= 32'sd0;
+        else if (dv_w) mC_r <= ( $signed({{16{raw_w[15]}},raw_w}) * 32'sd1000 ) >>> 7;
+    end
+
+    // ---- UART TX ----
+    wire       tx_busy_w;
+    reg        tx_go_r;
+    reg [7:0]  tx_data_r;
+
+    uart_tx #(
+        .CLK_FREQ_HZ (CLK_FREQ_HZ),
+        .BAUD        (BAUD)
+    ) u_tx (
+        .clk_i       (clk_i),
+        .rst_al_i    (rst_al_i),
+        .tx_start_i  (tx_go_r),
+        .tx_data_i   (tx_data_r),
+        .tx_busy_o   (tx_busy_w),
+        .tx_o        (uart_tx_o)
+    );
+
+    // ---- Basit formatter: "TMP117: ±DD.DDD°C\r\n" ----
+    // mC → sign + int + frac3
+    reg        fmt_run_r;
+    reg [3:0]  step_r;
+    reg        sign_neg_r;
+    reg [31:0] abs_mC_r;
+    reg [15:0] deg_r;    // integer °C
+    reg [9:0]  frac_r;   // 0..999
+
+    function [7:0] ascii; input [3:0] d; begin ascii = 8'd48 + d[3:0]; end endfunction
+
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            fmt_run_r  <= 1'b0;
+            step_r     <= 4'd0;
+            tx_go_r    <= 1'b0;
+            tx_data_r  <= 8'h00;
+            sign_neg_r <= 1'b0;
+            abs_mC_r   <= 32'd0;
+            deg_r      <= 16'd0;
+            frac_r     <= 10'd0;
+        end else begin
+            tx_go_r <= 1'b0;
+
+            // Yeni veri gelince dönüştürmeyi başlat
+            if (dv_w && !fmt_run_r) begin
+                fmt_run_r  <= 1'b1;
+                step_r     <= 4'd0;
+                sign_neg_r <= (mC_r < 0);
+                abs_mC_r   <= (mC_r < 0) ? -mC_r : mC_r;
+                deg_r      <= ((mC_r < 0) ? -mC_r : mC_r) / 32'd1000;
+                frac_r     <= ((mC_r < 0) ? -mC_r : mC_r) % 32'd1000;
+            end
+
+            if (fmt_run_r && !tx_busy_w) begin
+                case (step_r)
+                    // "T","M","P","1","1","7",":"," "
+                    4'd0:  begin tx_data_r<=8'h54; tx_go_r<=1'b1; step_r<=4'd1; end
+                    4'd1:  begin tx_data_r<=8'h4D; tx_go_r<=1'b1; step_r<=4'd2; end
+                    4'd2:  begin tx_data_r<=8'h50; tx_go_r<=1'b1; step_r<=4'd3; end
+                    4'd3:  begin tx_data_r<=8'h31; tx_go_r<=1'b1; step_r<=4'd4; end
+                    4'd4:  begin tx_data_r<=8'h31; tx_go_r<=1'b1; step_r<=4'd5; end
+                    4'd5:  begin tx_data_r<=8'h37; tx_go_r<=1'b1; step_r<=4'd6; end
+                    4'd6:  begin tx_data_r<=8'h3A; tx_go_r<=1'b1; step_r<=4'd7; end
+                    4'd7:  begin tx_data_r<=8'h20; tx_go_r<=1'b1; step_r<=4'd8; end
+                    // sign
+                    4'd8:  begin tx_data_r<= sign_neg_r ? 8'h2D : 8'h2B; tx_go_r<=1'b1; step_r<=4'd9; end
+                    // DD (yüzler+onlar+birler — leading zero’ları da yazar)
+                    4'd9:  begin tx_data_r<= ascii( (deg_r/100)%10 ); tx_go_r<=1'b1; step_r<=4'd10; end
+                    4'd10: begin tx_data_r<= ascii( (deg_r/10)%10  ); tx_go_r<=1'b1; step_r<=4'd11; end
+                    4'd11: begin tx_data_r<= ascii( deg_r%10 );       tx_go_r<=1'b1; step_r<=4'd12; end
+                    // "."
+                    4'd12: begin tx_data_r<=8'h2E; tx_go_r<=1'b1; step_r<=4'd13; end
+                    // DDD (millicelsius)
+                    4'd13: begin tx_data_r<= ascii( (frac_r/100)%10 ); tx_go_r<=1'b1; step_r<=4'd14; end
+                    4'd14: begin tx_data_r<= ascii( (frac_r/10)%10  ); tx_go_r<=1'b1; step_r<=4'd15; end
+                    4'd15: begin tx_data_r<= ascii( frac_r%10 );       tx_go_r<=1'b1; step_r<=4'd16; end
+                    // "°","C","\r","\n"
+                    4'd16: begin tx_data_r<=8'hC2; tx_go_r<=1'b1; step_r<=4'd17; end // UTF-8 '°' = C2 B0 (isteğe bağlı)
+                    4'd17: begin tx_data_r<=8'hB0; tx_go_r<=1'b1; step_r<=4'd18; end
+                    4'd18: begin tx_data_r<=8'h43; tx_go_r<=1'b1; step_r<=4'd19; end // 'C'
+                    4'd19: begin tx_data_r<=8'h0D; tx_go_r<=1'b1; step_r<=4'd20; end
+                    4'd20: begin tx_data_r<=8'h0A; tx_go_r<=1'b1; step_r<=4'd21; end
+                    default: begin fmt_run_r<=1'b0; end
+                endcase
+            end
+        end
+    end
+
+endmodule
