@@ -1,0 +1,668 @@
+// tmp117_controller.v
+// TMP117: START+(0x48|W)+0x00, REP-START+(0x48|R), MSB(ACK), LSB(NACK), STOP
+module tmp117_controller
+#(
+    // Aynı i2c_master parametre mantığı ile
+    parameter SYS_CLK_FREQ      = 50_000_000,   // Senin sisteme göre 50MHz varsaydım
+    parameter I2C_BUS_CLK_FREQ  =    100_000    // 100kHz
+)
+(
+    input         clk_i,                 //!system clk
+    input         rst_al_i,              //!active-low asynchronous reset
+
+    inout         tmp117_scl_io,         //!I2C SCL
+    inout         tmp117_sda_io,         //!I2C SDA
+
+    output        tmp117_data_valid_o,   //!Yeni sıcaklık geçerli (1 clk)
+    output [15:0] tmp117_data_raw_o,     //!TMP117 16-bit raw (two's complement; 1 LSB = 7.8125 m°C)
+    output        tmp117_id_error_o,     //!Opsiyonel: Device ID beklenenle eşleşmedi (0117h)
+    output        tmp117_ack_error_o     //!I2C ACK hata bayrağı (i2c_master’dan)
+);
+
+    //=========================
+    // Sabitler
+    //=========================
+    localparam [6:0] DEVICE_ADDR   = 7'b1001000; // ADDR pin GND → 0x48 (TMP117 datasheet) 
+    localparam [7:0] PTR_TEMP      = 8'h00;      // Temperature Result Register pointer (00h) 
+    localparam [7:0] PTR_DEVICE_ID = 8'h0F;      // Device ID pointer (0Fh), okunan değer 0117h olmalı 
+    localparam [15:0] EXPECT_DEV_ID= 16'h0117;   // Beklenen Device ID (datasheet) 
+
+    // Adt7410’daki TBUF konseptini aynen aldım (duraklatma/rahat zamanlama için)
+    localparam integer TBUF_LIM = 5000;          // ~50us @ 100 MHz → senin 50 MHz’te ~100us olur; ihtiyaca göre ayarlayabilirsin
+
+    //=========================
+    // Sinyaller
+    //=========================
+    // I2C master arayüzü (senin çalışan i2c_master ile birebir uyumlu)
+    wire        busy_w;
+    wire [7:0]  data_rd_w;
+    wire        ack_error_w;
+    reg         i2c_en_r;
+    reg         rw_r;
+    reg  [7:0]  data_wr_r;
+
+    // Busy kenar sayacı – adt7410’daki gibi
+    reg         busy_prev_r;
+    reg         busy_r;
+    reg  [2:0]  busy_cntr_r;
+    reg         reset_busy_cntr_r;
+
+    // Zamanlayıcı (tBUF)
+    reg  [$clog2(TBUF_LIM):0] tbuf_cntr_r;
+    reg         tbuf_timer_en_r;
+    reg         timer_done_r;
+
+    // Çıktılar ve ara kayıtlar
+    reg  [15:0] temp_r, temp_ff_r;
+    reg         data_valid_r;
+    reg         id_error_r, id_error_ff_r;
+    reg  [15:0] id_rd_r, id_rd_ff_r;
+
+    //=========================
+    // Durum makinesi (ADT stil)
+    //=========================
+    localparam STATE_WIDTH = 4;
+    localparam [STATE_WIDTH-1:0]
+        S_ID_WRPTR  = 'd1,  // Device ID pointer yaz (0x0F)
+        S_ID_READ   = 'd2,  // 2 byte Device ID oku
+        S_READ_TEMP = 'd4,  // 2 byte sıcaklık oku
+        S_IDLE_GAP  = 'd8;  // küçük bekleme/ayraç (tBUF)
+
+    reg [STATE_WIDTH-1:0] state, next_state /* synthesis syn_encoding = "safe,onehot" */;
+
+    //=========================
+    // State FF
+    //=========================
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if(!rst_al_i) state <= S_ID_WRPTR;
+        else          state <= next_state;
+    end
+
+    //=========================
+    // Busy Kenar Sayacı (ADT mantığı)
+    //=========================
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if(!rst_al_i) begin
+            busy_prev_r <= 1'b0;
+            busy_r      <= 1'b0;
+            busy_cntr_r <= 3'd0;
+        end else begin
+            busy_r      <= busy_w;
+            busy_prev_r <= busy_r;
+            if (busy_prev_r == 1'b0 && busy_r == 1'b1) begin
+                busy_cntr_r <= busy_cntr_r + 3'd1;  // I2C üzerinde yeni “frame/alt-adım” başladı
+            end else if (reset_busy_cntr_r) begin
+                busy_cntr_r <= 3'd0;
+            end
+        end
+    end
+
+    //=========================
+    // FF’ler
+    //=========================
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if(!rst_al_i) begin
+            temp_ff_r     <= 16'h0000;
+            id_rd_ff_r    <= 16'h0000;
+            id_error_ff_r <= 1'b0;
+        end else begin
+            temp_ff_r     <= temp_r;
+            id_rd_ff_r    <= id_rd_r;
+            id_error_ff_r <= id_error_r;
+        end
+    end
+
+    //=========================
+    // tBUF Zamanlayıcısı (ADT’deki ile aynı mantık)
+    //=========================
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if(!rst_al_i) begin
+            tbuf_cntr_r  <= 0;
+            timer_done_r <= 1'b0;
+        end else begin
+            timer_done_r <= 1'b0;
+            if (tbuf_timer_en_r) begin
+                if (tbuf_cntr_r == TBUF_LIM-1) begin
+                    tbuf_cntr_r  <= 0;
+                    timer_done_r <= 1'b1;
+                end else begin
+                    tbuf_cntr_r  <= tbuf_cntr_r + 1;
+                end
+            end else begin
+                tbuf_cntr_r  <= 0;
+            end
+        end
+    end
+
+    //=========================
+    // Kontrolcü (ADT’nin “busy_cntr” adımlarıyla)
+    //=========================
+    always @(*) begin
+        // Defaults
+        next_state         = state;
+        i2c_en_r           = 1'b0;
+        rw_r               = 1'b0;       // default: write
+        data_wr_r          = 8'h00;
+        reset_busy_cntr_r  = 1'b0;
+        tbuf_timer_en_r    = 1'b0;
+        data_valid_r       = 1'b0;
+        id_error_r         = id_error_ff_r;
+        temp_r             = temp_ff_r;
+        id_rd_r            = id_rd_ff_r;
+
+        case (state)
+
+            // 1) Device ID pointer yaz (0x0F)
+            S_ID_WRPTR: begin
+                case (busy_cntr_r)
+                    3'd0: begin
+                        if (busy_r==1'b0) begin
+                            i2c_en_r  = 1'b1;           // başlat
+                            rw_r      = 1'b0;           // write
+                            data_wr_r = PTR_DEVICE_ID;  // 0x0F pointer
+                        end
+                    end
+                    3'd1: begin
+                        // Repeated START + READ (ilk byte — MSB)
+                        i2c_en_r  = 1'b1;
+                        rw_r      = 1'b1;   // read
+                        data_wr_r = 8'd0;
+                    end
+                    3'd2: begin
+                        // READ (ikinci byte — LSB) — MSB’yi latch’le
+                        i2c_en_r  = 1'b1;
+                        rw_r      = 1'b1;
+                        data_wr_r = 8'd0;
+                        if (busy_r==1'b0) begin
+                            id_rd_r[15:8] = data_rd_w;
+                        end
+                    end
+                    3'd3: begin
+                        // Son byte LSB geldi → durakla → karşılaştır
+                        i2c_en_r = 1'b0; // bırak
+                        if (busy_r==1'b0) begin
+                            id_rd_r[7:0] = data_rd_w;
+                            tbuf_timer_en_r = 1'b1;
+                            if (timer_done_r) begin
+                                id_error_r         = (id_rd_r != EXPECT_DEV_ID);
+                                tbuf_timer_en_r    = 1'b0;
+                                reset_busy_cntr_r  = 1'b1;
+                                next_state         = S_READ_TEMP;
+                            end
+                        end
+                    end
+                    default: begin
+                        reset_busy_cntr_r = 1'b1;
+                    end
+                endcase
+            end
+
+            // 2) Temperature register oku (pointer 0x00 → 2 byte read)
+            S_READ_TEMP: begin
+                case (busy_cntr_r)
+                    3'd0: begin
+                        if (busy_r==1'b0) begin
+                            i2c_en_r  = 1'b1;
+                            rw_r      = 1'b0;       // write
+                            data_wr_r = PTR_TEMP;  // 0x00 pointer (Temp_Result)
+                        end
+                    end
+                    3'd1: begin
+                        // Repeated START + READ (MSB)
+                        i2c_en_r  = 1'b1;
+                        rw_r      = 1'b1;
+                        data_wr_r = 8'd0;
+                    end
+                    3'd2: begin
+                        // READ (LSB) — MSB latch
+                        i2c_en_r  = 1'b1;
+                        rw_r      = 1'b1;
+                        data_wr_r = 8'd0;
+                        if (busy_r==1'b0) begin
+                            temp_r[15:8] = data_rd_w;
+                        end
+                    end
+                    3'd3: begin
+                        // LSB’yi al, data_valid pulse üret, tBUF, sonra ID read’e dön (ADT’de cfg read-back gibi)
+                        i2c_en_r = 1'b0;
+                        if (busy_r==1'b0) begin
+                            temp_r[7:0] = data_rd_w;
+                            data_valid_r = 1'b1;
+                            tbuf_timer_en_r = 1'b1;
+                            if (timer_done_r) begin
+                                tbuf_timer_en_r    = 1'b0;
+                                reset_busy_cntr_r  = 1'b1;
+                                next_state         = S_ID_WRPTR; // periyodik olarak ID tekrar bakmak istemezsen S_IDLE_GAP de koyabilirsin
+                            end
+                        end
+                    end
+                    default: begin
+                        reset_busy_cntr_r = 1'b1;
+                    end
+                endcase
+            end
+
+            // Kullanmak istersen: sade bir bekleme durumu
+            S_IDLE_GAP: begin
+                tbuf_timer_en_r = 1'b1;
+                if (timer_done_r) begin
+                    tbuf_timer_en_r   = 1'b0;
+                    reset_busy_cntr_r = 1'b1;
+                    next_state        = S_READ_TEMP;
+                end
+            end
+
+            default: begin
+                next_state        = S_ID_WRPTR;
+                reset_busy_cntr_r = 1'b1;
+            end
+        endcase
+    end
+
+    //=========================
+    // Bileşenler (Aynı i2c_master)
+    //=========================
+    i2c_master #(
+        .SYS_CLK_FREQ     (SYS_CLK_FREQ),
+        .I2C_BUS_CLK_FREQ (I2C_BUS_CLK_FREQ)
+    ) i2c_master_0 (
+        .clk_i       (clk_i),
+        .rst_al_i    (rst_al_i),
+        .en_i        (i2c_en_r),
+        .addr_i      (DEVICE_ADDR),
+        .rw_i        (rw_r),
+        .data_wr_i   (data_wr_r),
+        .busy_o      (busy_w),
+        .data_rd_o   (data_rd_w),
+        .ack_error_o (ack_error_w),
+        .sda_io      (tmp117_sda_io),
+        .scl_io      (tmp117_scl_io)
+    ); // Çekirdeğin port/protokolü, senin dosyanla birebir aynı. 
+
+    //=========================
+    // Çıkışlar
+    //=========================
+    assign tmp117_data_valid_o = data_valid_r;
+    assign tmp117_data_raw_o   = temp_ff_r;    // 16-bit two's complement; LSB = 7.8125 m°C (0.0078125°C) 
+    assign tmp117_id_error_o   = id_error_ff_r;
+    assign tmp117_ack_error_o  = ack_error_w;
+
+endmodule
+
+**
+// ============================================================================
+// uart_tx.v — Basit 8N1 UART verici
+// param: CLK_HZ, BAUD
+// Arayüz:
+//   tx_start_i: 1 clk pulse → tx_data_i'yi gönder
+//   tx_busy_o : gönderim boyunca 1
+// ============================================================================
+module uart_tx
+#(
+    parameter integer CLK_HZ = 50_000_000,
+    parameter integer BAUD   =    115_200
+)
+(
+    input  clk_i,
+    input  rst_al_i,
+
+    input  tx_start_i,
+    input  [7:0] tx_data_i,
+    output tx_busy_o,
+    output tx_o
+);
+    localparam integer DIV = CLK_HZ / BAUD;
+
+    reg        busy_r;
+    reg [3:0]  bitpos_r;   // 0..9 (start + 8 data + stop)
+    reg [7:0]  data_r;
+    reg [15:0] cnt_r;
+    reg        tx_r;
+
+    assign tx_busy_o = busy_r;
+    assign tx_o      = tx_r;
+
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            busy_r   <= 1'b0;
+            bitpos_r <= 4'd0;
+            data_r   <= 8'h00;
+            cnt_r    <= 16'd0;
+            tx_r     <= 1'b1; // idle=1
+        end else begin
+            if (!busy_r) begin
+                if (tx_start_i) begin
+                    busy_r   <= 1'b1;
+                    bitpos_r <= 4'd0;
+                    data_r   <= tx_data_i;
+                    cnt_r    <= 16'd0;
+                    tx_r     <= 1'b0; // start bit
+                end
+            end else begin
+                if (cnt_r == DIV-1) begin
+                    cnt_r    <= 16'd0;
+                    bitpos_r <= bitpos_r + 4'd1;
+                    case (bitpos_r)
+                        4'd0: tx_r <= data_r[0];
+                        4'd1: tx_r <= data_r[1];
+                        4'd2: tx_r <= data_r[2];
+                        4'd3: tx_r <= data_r[3];
+                        4'd4: tx_r <= data_r[4];
+                        4'd5: tx_r <= data_r[5];
+                        4'd6: tx_r <= data_r[6];
+                        4'd7: tx_r <= data_r[7];
+                        4'd8: tx_r <= 1'b1;   // stop
+                        4'd9: begin
+                            tx_r   <= 1'b1;
+                            busy_r <= 1'b0;
+                        end
+                        default: ;
+                    endcase
+                end else begin
+                    cnt_r <= cnt_r + 16'd1;
+                end
+            end
+        end
+    end
+endmodule
+
+>>
+// ============================================================================
+// top_tmp117_uart.v — TMP117 okur, "±DD.DDD C\r\n" olarak UART'a basar
+// Not: tmp117_controller.v daha önce verdiğim sürüm olmalı (içinde i2c_master var).
+// I/O standardı: SCL/SDA pinleri 3.3V bankta LVCMOS33, harici 10k pull-up sensör kartında.
+// ============================================================================
+module top_tmp117_uart
+#(
+    parameter integer CLK_HZ = 50_000_000,
+    parameter integer I2C_HZ =    100_000,
+    parameter integer BAUD   =    115_200
+)
+(
+    input  clk_i,
+    input  rst_al_i,       // aktif düşük
+
+    inout  sda_io,
+    inout  scl_io,
+
+    output uart_tx_o,
+
+    // basit debug
+    output led_dv_o,       // data_valid pulse
+    output led_ackerr_o    // i2c ack error latched
+);
+    // ---------------- TMP117 controller ----------------
+    wire        dv_w;
+    wire [15:0] raw_w;
+    wire        ackerr_w;
+
+    // tmp117_controller: içeride senin i2c_master'ını instanti ediyor
+    tmp117_controller #(
+        .SYS_CLK_FREQ     (CLK_HZ),
+        .I2C_BUS_CLK_FREQ (I2C_HZ)
+    ) u_tmp117 (
+        .clk_i               (clk_i),
+        .rst_al_i            (rst_al_i),
+        .tmp117_scl_io       (scl_io),
+        .tmp117_sda_io       (sda_io),
+        .tmp117_data_valid_o (dv_w),
+        .tmp117_data_raw_o   (raw_w),
+        .tmp117_id_error_o   (/*open*/),
+        .tmp117_ack_error_o  (ackerr_w)
+    );
+
+    // ---------------- raw(1/128°C) → milli-°C ----------------
+    // mC = raw * 1000 / 128
+    reg signed [31:0] mC_r;
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) mC_r <= 32'sd0;
+        else if (dv_w) mC_r <= ( $signed({{16{raw_w[15]}}, raw_w}) * 32'sd1000 ) >>> 7;
+    end
+
+    // ---------------- UART TX ----------------
+    wire       tx_busy_w;
+    reg        tx_go_r;
+    reg  [7:0] tx_data_r;
+
+    uart_tx #(
+        .CLK_HZ (CLK_HZ),
+        .BAUD   (BAUD)
+    ) u_tx (
+        .clk_i      (clk_i),
+        .rst_al_i   (rst_al_i),
+        .tx_start_i (tx_go_r),
+        .tx_data_i  (tx_data_r),
+        .tx_busy_o  (tx_busy_w),
+        .tx_o       (uart_tx_o)
+    );
+
+    // ---------------- Basit Formatter ----------------
+    // "TMP117: ±DD.DDD C\r\n"
+    // Not: derece sembolü yerine boşluk kullandım (terminal uyumu için)
+    function [7:0] ascii; input [3:0] d; begin ascii = 8'd48 + d[3:0]; end endfunction
+
+    reg        fmt_run_r;
+    reg [4:0]  step_r;
+
+    reg        sign_neg_r;
+    reg [31:0] abs_mC_r;
+    reg [15:0] deg_r;
+    reg [9:0]  frac_r;
+
+    // debug LED’ler
+    assign led_dv_o     = dv_w;
+    reg    ackerr_latch_r;
+    always @(posedge clk_i or negedge rst_al_i)
+        if (!rst_al_i) ackerr_latch_r <= 1'b0;
+        else if (ackerr_w) ackerr_latch_r <= 1'b1;
+    assign led_ackerr_o = ackerr_latch_r;
+
+    // veri geldiğinde dönüştürmeyi başlat
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            fmt_run_r  <= 1'b0;
+            step_r     <= 5'd0;
+            tx_go_r    <= 1'b0;
+            tx_data_r  <= 8'h00;
+            sign_neg_r <= 1'b0;
+            abs_mC_r   <= 32'd0;
+            deg_r      <= 16'd0;
+            frac_r     <= 10'd0;
+        end else begin
+            tx_go_r <= 1'b0;
+
+            if (dv_w && !fmt_run_r) begin
+                fmt_run_r  <= 1'b1;
+                step_r     <= 5'd0;
+                sign_neg_r <= (mC_r < 0);
+                abs_mC_r   <= (mC_r < 0) ? -mC_r : mC_r;
+                deg_r      <= ((mC_r < 0) ? -mC_r : mC_r) / 32'd1000;
+                frac_r     <= ((mC_r < 0) ? -mC_r : mC_r) % 32'd1000;
+            end
+
+            if (fmt_run_r && !tx_busy_w) begin
+                case (step_r)
+                    // "T","M","P","1","1","7",":"," "
+                    5'd0:  begin tx_data_r<=8'h54; tx_go_r<=1'b1; step_r<=5'd1;  end // T
+                    5'd1:  begin tx_data_r<=8'h4D; tx_go_r<=1'b1; step_r<=5'd2;  end // M
+                    5'd2:  begin tx_data_r<=8'h50; tx_go_r<=1'b1; step_r<=5'd3;  end // P
+                    5'd3:  begin tx_data_r<=8'h31; tx_go_r<=1'b1; step_r<=5'd4;  end // 1
+                    5'd4:  begin tx_data_r<=8'h31; tx_go_r<=1'b1; step_r<=5'd5;  end // 1
+                    5'd5:  begin tx_data_r<=8'h37; tx_go_r<=1'b1; step_r<=5'd6;  end // 7
+                    5'd6:  begin tx_data_r<=8'h3A; tx_go_r<=1'b1; step_r<=5'd7;  end // :
+                    5'd7:  begin tx_data_r<=8'h20; tx_go_r<=1'b1; step_r<=5'd8;  end // space
+                    // sign
+                    5'd8:  begin tx_data_r<= sign_neg_r ? 8'h2D : 8'h2B; tx_go_r<=1'b1; step_r<=5'd9; end
+                    // DD.DDD
+                    5'd9:  begin tx_data_r<= ascii( (deg_r/100)%10 ); tx_go_r<=1'b1; step_r<=5'd10; end
+                    5'd10: begin tx_data_r<= ascii( (deg_r/10)%10  ); tx_go_r<=1'b1; step_r<=5'd11; end
+                    5'd11: begin tx_data_r<= ascii(  deg_r%10      ); tx_go_r<=1'b1; step_r<=5'd12; end
+                    5'd12: begin tx_data_r<=8'h2E;                 tx_go_r<=1'b1; step_r<=5'd13; end // '.'
+                    5'd13: begin tx_data_r<= ascii( (frac_r/100)%10 ); tx_go_r<=1'b1; step_r<=5'd14; end
+                    5'd14: begin tx_data_r<= ascii( (frac_r/10)%10  ); tx_go_r<=1'b1; step_r<=5'd15; end
+                    5'd15: begin tx_data_r<= ascii(  frac_r%10      ); tx_go_r<=1'b1; step_r<=5'd16; end
+                    // " C", CR, LF
+                    5'd16: begin tx_data_r<=8'h20; tx_go_r<=1'b1; step_r<=5'd17; end // space
+                    5'd17: begin tx_data_r<=8'h43; tx_go_r<=1'b1; step_r<=5'd18; end // 'C'
+                    5'd18: begin tx_data_r<=8'h0D; tx_go_r<=1'b1; step_r<=5'd19; end // CR
+                    5'd19: begin tx_data_r<=8'h0A; tx_go_r<=1'b1; step_r<=5'd20; end // LF
+                    default: begin fmt_run_r
+
+Bgphphşhşhph
+
+// ============================================================================
+// top_tmp117_uart.v — TMP117 okur, "±DD.DDD C\r\n" olarak UART'a basar
+// Not: tmp117_controller.v daha önce verdiğim sürüm olmalı (içinde i2c_master var).
+// I/O standardı: SCL/SDA pinleri 3.3V bankta LVCMOS33, harici 10k pull-up sensör kartında.
+// ============================================================================
+module top_tmp117_uart
+#(
+    parameter integer CLK_HZ = 50_000_000,
+    parameter integer I2C_HZ =    100_000,
+    parameter integer BAUD   =    115_200
+)
+(
+    input  clk_i,
+    input  rst_al_i,       // aktif düşük
+
+    inout  sda_io,
+    inout  scl_io,
+
+    output uart_tx_o,
+
+    // basit debug
+    output led_dv_o,       // data_valid pulse
+    output led_ackerr_o    // i2c ack error latched
+);
+    // ---------------- TMP117 controller ----------------
+    wire        dv_w;
+    wire [15:0] raw_w;
+    wire        ackerr_w;
+
+    // tmp117_controller: içeride senin i2c_master'ını instanti ediyor
+    tmp117_controller #(
+        .SYS_CLK_FREQ     (CLK_HZ),
+        .I2C_BUS_CLK_FREQ (I2C_HZ)
+    ) u_tmp117 (
+        .clk_i               (clk_i),
+        .rst_al_i            (rst_al_i),
+        .tmp117_scl_io       (scl_io),
+        .tmp117_sda_io       (sda_io),
+        .tmp117_data_valid_o (dv_w),
+        .tmp117_data_raw_o   (raw_w),
+        .tmp117_id_error_o   (/*open*/),
+        .tmp117_ack_error_o  (ackerr_w)
+    );
+
+    // ---------------- raw(1/128°C) → milli-°C ----------------
+    // mC = raw * 1000 / 128
+    reg signed [31:0] mC_r;
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) mC_r <= 32'sd0;
+        else if (dv_w) mC_r <= ( $signed({{16{raw_w[15]}}, raw_w}) * 32'sd1000 ) >>> 7;
+    end
+
+    // ---------------- UART TX ----------------
+    wire       tx_busy_w;
+    reg        tx_go_r;
+    reg  [7:0] tx_data_r;
+
+    uart_tx #(
+        .CLK_HZ (CLK_HZ),
+        .BAUD   (BAUD)
+    ) u_tx (
+        .clk_i      (clk_i),
+        .rst_al_i   (rst_al_i),
+        .tx_start_i (tx_go_r),
+        .tx_data_i  (tx_data_r),
+        .tx_busy_o  (tx_busy_w),
+        .tx_o       (uart_tx_o)
+    );
+
+    // ---------------- Basit Formatter ----------------
+    // "TMP117: ±DD.DDD C\r\n"
+    // Not: derece sembolü yerine boşluk kullandım (terminal uyumu için)
+    function [7:0] ascii; input [3:0] d; begin ascii = 8'd48 + d[3:0]; end endfunction
+
+    reg        fmt_run_r;
+    reg [4:0]  step_r;
+
+    reg        sign_neg_r;
+    reg [31:0] abs_mC_r;
+    reg [15:0] deg_r;
+    reg [9:0]  frac_r;
+
+    // debug LED’ler
+    assign led_dv_o     = dv_w;
+    reg    ackerr_latch_r;
+    always @(posedge clk_i or negedge rst_al_i)
+        if (!rst_al_i) ackerr_latch_r <= 1'b0;
+        else if (ackerr_w) ackerr_latch_r <= 1'b1;
+    assign led_ackerr_o = ackerr_latch_r;
+
+    // veri geldiğinde dönüştürmeyi başlat
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            fmt_run_r  <= 1'b0;
+            step_r     <= 5'd0;
+            tx_go_r    <= 1'b0;
+            tx_data_r  <= 8'h00;
+            sign_neg_r <= 1'b0;
+            abs_mC_r   <= 32'd0;
+            deg_r      <= 16'd0;
+            frac_r     <= 10'd0;
+        end else begin
+            tx_go_r <= 1'b0;
+
+            if (dv_w && !fmt_run_r) begin
+                fmt_run_r  <= 1'b1;
+                step_r     <= 5'd0;
+                sign_neg_r <= (mC_r < 0);
+                abs_mC_r   <= (mC_r < 0) ? -mC_r : mC_r;
+                deg_r      <= ((mC_r < 0) ? -mC_r : mC_r) / 32'd1000;
+                frac_r     <= ((mC_r < 0) ? -mC_r : mC_r) % 32'd1000;
+            end
+
+            if (fmt_run_r && !tx_busy_w) begin
+                case (step_r)
+                    // "T","M","P","1","1","7",":"," "
+                    5'd0:  begin tx_data_r<=8'h54; tx_go_r<=1'b1; step_r<=5'd1;  end // T
+                    5'd1:  begin tx_data_r<=8'h4D; tx_go_r<=1'b1; step_r<=5'd2;  end // M
+                    5'd2:  begin tx_data_r<=8'h50; tx_go_r<=1'b1; step_r<=5'd3;  end // P
+                    5'd3:  begin tx_data_r<=8'h31; tx_go_r<=1'b1; step_r<=5'd4;  end // 1
+                    5'd4:  begin tx_data_r<=8'h31; tx_go_r<=1'b1; step_r<=5'd5;  end // 1
+                    5'd5:  begin tx_data_r<=8'h37; tx_go_r<=1'b1; step_r<=5'd6;  end // 7
+                    5'd6:  begin tx_data_r<=8'h3A; tx_go_r<=1'b1; step_r<=5'd7;  end // :
+                    5'd7:  begin tx_data_r<=8'h20; tx_go_r<=1'b1; step_r<=5'd8;  end // space
+                    // sign
+                    5'd8:  begin tx_data_r<= sign_neg_r ? 8'h2D : 8'h2B; tx_go_r<=1'b1; step_r<=5'd9; end
+                    // DD.DDD
+                    5'd9:  begin tx_data_r<= ascii( (deg_r/100)%10 ); tx_go_r<=1'b1; step_r<=5'd10; end
+                    5'd10: begin tx_data_r<= ascii( (deg_r/10)%10  ); tx_go_r<=1'b1; step_r<=5'd11; end
+                    5'd11: begin tx_data_r<= ascii(  deg_r%10      ); tx_go_r<=1'b1; step_r<=5'd12; end
+                    5'd12: begin tx_data_r<=8'h2E;                 tx_go_r<=1'b1; step_r<=5'd13; end // '.'
+                    5'd13: begin tx_data_r<= ascii( (frac_r/100)%10 ); tx_go_r<=1'b1; step_r<=5'd14; end
+                    5'd14: begin tx_data_r<= ascii( (frac_r/10)%10  ); tx_go_r<=1'b1; step_r<=5'd15; end
+                    5'd15: begin tx_data_r<= ascii(  frac_r%10      ); tx_go_r<=1'b1; step_r<=5'd16; end
+                    // " C", CR, LF
+                    5'd16: begin tx_data_r<=8'h20; tx_go_r<=1'b1; step_r<=5'd17; end // space
+                    5'd17: begin tx_data_r<=8'h43; tx_go_r<=1'b1; step_r<=5'd18; end // 'C'
+                    5'd18: begin tx_data_r<=8'h0D; tx_go_r<=1'b1; step_r<=5'd19; end // CR
+                    5'd19: begin tx_data_r<=8'h0A; tx_go_r<=1'b1; step_r<=5'd20; end // LF
+                    default: begin fmt_run_r<=1'b0; end
+                endcase
+            end
+        end
+    end
+endmodule
+
+
+
+
+
+
+
+
+
+
+
