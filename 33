@@ -927,3 +927,369 @@ module i2c_master
         end
     end
 endmodule 
+.......
+`timescale 1ns/1ps
+//==============================================================================
+// Testbench : tb_ltc2666_system.v
+// Amaç      : LTC2666 controller için kapsamlı, self-checking sim senaryoları
+// Araçlar   : Vivado xsim/Questa ile çalışır.
+// Notlar    : - Testbench kaynak (driver) sinyalleri *_r sonekli (istenen format).
+//             - Dahili hafif spi_master_model, echo bozma/sayma yetenekli.
+//==============================================================================
+
+//------------------------- Hafif SPI master modeli ----------------------------
+// - SPI zamanlamasını bit seviyesinde taklit etmez; handshake + echo davranışı.
+// - INJECT_BAD_AT transfer numarasında 1 kez yanlış echo üretir (test amaçlı).
+module spi_master_model #(
+    parameter integer WIDTH           = 32,
+    parameter integer LATENCY_CYC     = 8,
+    parameter integer INJECT_BAD_AT   = 0   // 0 => hiç bozma; N => N'inci DONE'da boz
+)(
+    input               clk_i,
+    input               rst_n_i,
+    input               spi_enable_i,
+    input  [WIDTH-1:0]  tx_data_i,
+    output [WIDTH-1:0]  rx_data_o,
+    output              data_valid_o,
+    output              busy_o,
+    // fiziksel hatlar sadece görünürlük için; gerçek dalga üretilmez
+    output              mosi_o,
+    input               miso_i,
+    output              sclk_o,
+    output              cs_o
+);
+    reg [WIDTH-1:0] r_rx, r_prev, r_tx;
+    reg [7:0]       r_cnt;
+    reg             r_busy, r_done;
+    reg [31:0]      r_done_cnt;
+    assign rx_data_o    = r_rx;
+    assign data_valid_o = r_done;
+    assign busy_o       = r_busy;
+    assign mosi_o       = 1'b0;
+    assign sclk_o       = 1'b0;
+    assign cs_o         = 1'b1;
+
+    always @(posedge clk_i or negedge rst_n_i) begin
+        if (!rst_n_i) begin
+            r_rx<=0; r_prev<=0; r_tx<=0; r_cnt<=0; r_busy<=0; r_done<=0; r_done_cnt<=0;
+        end else begin
+            r_done<=0;
+            if (spi_enable_i && !r_busy) begin
+                r_busy   <= 1'b1;
+                r_cnt    <= LATENCY_CYC[7:0];
+                r_tx     <= tx_data_i;
+            end else if (r_busy) begin
+                if (r_cnt==0) begin
+                    r_busy   <= 1'b0;
+                    r_done   <= 1'b1;
+                    r_done_cnt <= r_done_cnt + 1;
+                    // echo: normalde prev döner, belirli bir done sayısında boz
+                    if (INJECT_BAD_AT!=0 && r_done_cnt+1==INJECT_BAD_AT)
+                        r_rx <= r_prev ^ {WIDTH{1'b1}};
+                    else
+                        r_rx <= r_prev;
+                    r_prev <= r_tx;
+                end else begin
+                    r_cnt <= r_cnt - 1'b1;
+                end
+            end
+        end
+    end
+endmodule
+
+//------------------------------ Testbench -------------------------------------
+module tb_ltc2666_system;
+    // -------- Parametreler --------
+    localparam integer CLK_HZ     = 100_000_000;
+    localparam real    CLK_PERIOD = 1e9/CLK_HZ; // ns
+    localparam integer FRAME_BITS = 32;         // 32-bit: echo aktif
+    localparam integer CLR_CYCLES = 4;
+
+    // -------- Saat / Reset --------
+    reg  clk_r;
+    reg  rst_n_r;
+    initial begin clk_r = 1'b0; forever #(CLK_PERIOD/2.0) clk_r = ~clk_r; end
+    initial begin
+        rst_n_r = 1'b0;
+        #(10*CLK_PERIOD);
+        rst_n_r = 1'b1;
+    end
+
+    // -------- Mesaj arayüzü (driver, *_r) --------
+    reg         msg_valid_r;
+    wire        msg_ready_w;
+    reg  [3:0]  msg_cmd_r;
+    reg  [7:0]  msg_mask_r;
+    reg  [15:0] msg_data_r;
+    reg         clear_errors_r;
+
+    // -------- CLR / OVRTMP (driver, *_r) --------
+    reg         clr_pulse_r;
+    wire        clr_n_w;
+    reg         ovrtmp_in_r;        // DUT girişine giden TB sürücü
+    wire        ovrtmp_irq_w;
+    wire        ovrtmp_sticky_w;
+
+    // -------- SPI handshake wires --------
+    wire              spi_sclk_w, spi_mosi_w, spi_cs_w;
+    wire              spi_miso_w;
+    wire              busy_w, done_w, err_illegal_w, err_echo_w;
+
+    // -------- Controller ↔ SPI model bağlantıları --------
+    wire                 w_spi_start;
+    wire [31:0]          w_spi_tx;
+    wire [31:0]          w_spi_rx;
+    wire                 w_spi_busy;
+    wire                 w_spi_done;
+
+    // -------- DUT: ltc2666_controller (top kullanmadan direkt bağladık) ------
+    ltc2666_controller #(
+        .FRAME_BITS           (FRAME_BITS),
+        .APPEND_NOOP_FOR_ECHO (1),
+        .CLR_PULSE_CC         (CLR_CYCLES)
+    ) u_ctrl (
+        .clk_i          (clk_r),
+        .rst_n_i        (rst_n_r),
+
+        .msg_valid_i    (msg_valid_r),
+        .msg_ready_o    (msg_ready_w),
+        .msg_cmd_i      (msg_cmd_r),
+        .msg_chan_mask_i(msg_mask_r),
+        .msg_data_i     (msg_data_r),
+        .clear_errors_i (clear_errors_r),
+
+        .spi_start_o    (w_spi_start),
+        .spi_tx_o       (w_spi_tx),
+        .spi_rx_i       (w_spi_rx),
+        .spi_busy_i     (w_spi_busy),
+        .spi_done_i     (w_spi_done),
+
+        .clr_pulse_i    (clr_pulse_r),
+        .clr_n_o        (clr_n_w),
+        .ovrtmp_i       (ovrtmp_in_r),
+        .ovrtmp_irq_o   (ovrtmp_irq_w),
+        .ovrtmp_sticky_o(ovrtmp_sticky_w),
+
+        .busy_o         (busy_w),
+        .done_o         (done_w),
+        .err_illegal_o  (err_illegal_w),
+        .err_echo_o     (err_echo_w),
+        .last_echo_exp_o(),
+        .last_echo_rx_o ()
+    );
+
+    // -------- SPI master model --------
+    // INJECT_BAD_AT: 5 → 5. transferin echo'su bozulur (echo hatası testi)
+    spi_master_model #(
+        .WIDTH(FRAME_BITS),
+        .LATENCY_CYC(6),
+        .INJECT_BAD_AT(5)
+    ) u_spi_m (
+        .clk_i        (clk_r),
+        .rst_n_i      (rst_n_r),
+        .spi_enable_i (w_spi_start),
+        .tx_data_i    (w_spi_tx[FRAME_BITS-1:0]),
+        .rx_data_o    (w_spi_rx[FRAME_BITS-1:0]),
+        .data_valid_o (w_spi_done),
+        .busy_o       (w_spi_busy),
+        .mosi_o       (spi_mosi_w),
+        .miso_i       (spi_miso_w),
+        .sclk_o       (spi_sclk_w),
+        .cs_o         (spi_cs_w)
+    );
+
+    // MISO TB'de kullanılmıyor; model içten bağlar. Burada 0'a sabitleyelim.
+    assign spi_miso_w = 1'b0;
+
+    // -------- Komut sabitleri (controller ile aynı nibble'lar) ---------------
+    localparam [3:0] CMD_WRITE_CODE_N            = 4'b0000;
+    localparam [3:0] CMD_UPDATE_N                = 4'b0001;
+    localparam [3:0] CMD_WRITE_CODE_N_UPD_ALL    = 4'b0010;
+    localparam [3:0] CMD_WRITE_CODE_N_UPD_N      = 4'b0011;
+    localparam [3:0] CMD_POWER_DOWN_N            = 4'b0100;
+    localparam [3:0] CMD_POWER_DOWN_CHIP         = 4'b0101;
+    localparam [3:0] CMD_WRITE_SPAN_N            = 4'b0110;
+    localparam [3:0] CMD_CONFIG                  = 4'b0111;
+    localparam [3:0] CMD_WRITE_CODE_ALL          = 4'b1000;
+    localparam [3:0] CMD_UPDATE_ALL              = 4'b1001;
+    localparam [3:0] CMD_WRITE_CODE_ALL_UPD_ALL  = 4'b1010;
+    localparam [3:0] CMD_ANALOG_MUX              = 4'b1011;
+    localparam [3:0] CMD_TOGGLE_SELECT           = 4'b1100;
+    localparam [3:0] CMD_GLOBAL_TOGGLE           = 4'b1101;
+    localparam [3:0] CMD_NOOP                    = 4'b1111;
+
+    // -------- Yardımcı görevler ----------------------------------------------
+    task automatic wait_ready;
+        begin
+            @(posedge clk_r);
+            while (!msg_ready_w) @(posedge clk_r);
+        end
+    endtask
+
+    task automatic pulse_clear_errors;
+        begin
+            clear_errors_r <= 1'b1;
+            @(posedge clk_r);
+            clear_errors_r <= 1'b0;
+        end
+    endtask
+
+    task automatic pulse_clr;
+        begin
+            clr_pulse_r <= 1'b1;
+            @(posedge clk_r);
+            clr_pulse_r <= 1'b0;
+        end
+    endtask
+
+    // self-checking send (timeout + done + opsiyonel illegal beklenir)
+    task automatic send_msg_expect(
+        input [3:0]  cmd, input [7:0] mask, input [15:0] data,
+        input        expect_illegal, input integer timeout_clks
+    );
+        integer to;
+        begin
+            wait_ready();
+            msg_cmd_r   <= cmd;
+            msg_mask_r  <= mask;
+            msg_data_r  <= data;
+            msg_valid_r <= 1'b1;
+            @(posedge clk_r);
+            msg_valid_r <= 1'b0;
+
+            // illegal ise anında done gelir, spi_start olmayabilir
+            to = 0;
+            while (!done_w && to < timeout_clks) begin
+                @(posedge clk_r);
+                to = to + 1;
+            end
+            if (!done_w) begin
+                $fatal("[%0t] TIMEOUT: done gelmedi (cmd=%0h mask=%0h data=%0h)", $time, cmd, mask, data);
+            end
+
+            if (expect_illegal && !err_illegal_w)
+                $fatal("[%0t] Beklenen illegal hata gelmedi!", $time);
+            if (!expect_illegal && err_illegal_w)
+                $fatal("[%0t] Beklenmeyen illegal hata!", $time);
+
+            @(posedge clk_r); // done sonrası bir clock
+        end
+    endtask
+
+    // SPI start sayacı (NOOP eklendi mi diye bakmak için)
+    integer spi_start_count;
+    always @(posedge clk_r or negedge rst_n_r) begin
+        if (!rst_n_r) spi_start_count <= 0;
+        else if (w_spi_start) spi_start_count <= spi_start_count + 1;
+    end
+
+    // CLR low sayaç (CLR_PULSE_CC doğrulama)
+    integer clr_low_count;
+    reg     clr_low_phase;
+    always @(posedge clk_r or negedge rst_n_r) begin
+        if (!rst_n_r) begin
+            clr_low_count <= 0;
+            clr_low_phase <= 0;
+        end else begin
+            if (!clr_n_w) begin
+                clr_low_phase <= 1;
+                clr_low_count <= clr_low_count + 1;
+            end else if (clr_low_phase) begin
+                // low fazı bitti ⇒ sayıyı kilitleyip raporlayalım (bir kez)
+                $display("[%0t] CLR low toplam %0d clock", $time, clr_low_count);
+                // Tekrar test edilirse resetleyelim
+                clr_low_phase <= 0;
+                clr_low_count <= 0;
+            end
+        end
+    end
+
+    // -------- İzleme / log ----------------------------------------------------
+    initial begin
+        $display("time      st  ready valid busy  start done  spi_busy spi_done   tx(32)        rx(32)       err_illegal err_echo");
+        $monitor("[%0t]  %0d    %0b     %0b    %0b     %0b    %0b      %0b       %08h    %08h       %0b          %0b",
+                 $time, u_ctrl.st, msg_ready_w, msg_valid_r, busy_w, u_ctrl.r_spi_start, w_spi_done, w_spi_busy,
+                 w_spi_tx, w_spi_rx, err_illegal_w, err_echo_w);
+    end
+
+    // -------- Başlangıç değerleri --------------------------------------------
+    initial begin
+        msg_valid_r     = 0;
+        msg_cmd_r       = 0;
+        msg_mask_r      = 0;
+        msg_data_r      = 0;
+        clear_errors_r  = 0;
+        clr_pulse_r     = 0;
+        ovrtmp_in_r     = 1; // OVRTMP normalde HIGH
+    end
+
+    // -------- Senaryolar ------------------------------------------------------
+    initial begin : SCENARIOS
+        @(posedge rst_n_r);
+        $display("\n=== SCENARYO 1: CONFIG (int ref ON, TS ON) ===");
+        spi_start_count = 0;
+        send_msg_expect(CMD_CONFIG, 8'h00, 16'h0000, /*illegal?*/0, /*timeout*/2000);
+        // echo aktif ise son frame'in echo'su için NOOP beklenir → en az 1 start
+        if (spi_start_count < 1) $fatal("CONFIG sonrası en az 1 SPI start beklenirdi!");
+        $display("CONFIG tamam. spi_start_count=%0d", spi_start_count);
+
+        $display("\n=== SCENARYO 2: WRITE_SPAN_N ALL (±2.5V) ===");
+        spi_start_count = 0;
+        send_msg_expect(CMD_WRITE_SPAN_N, 8'hFF, 16'h0004, 0, 2000);
+        if (spi_start_count < 1) $fatal("SPAN sonrası en az 1 SPI start beklenirdi!");
+        $display("SPAN(±2.5V) tamam. spi_start_count=%0d", spi_start_count);
+
+        $display("\n=== SCENARYO 3: WRITE_CODE_N_UPD_N (CH0 & CH2 mid-scale) + UPDATE_ALL ===");
+        spi_start_count = 0;
+        send_msg_expect(CMD_WRITE_CODE_N_UPD_N, 8'b0000_0101, 16'h8000, 0, 2000);
+        // per-channel komutta en az iki kanal için 2 frame, echo NOOP ile 3+ olabilir
+        if (spi_start_count < 2) $fatal("Per-channel yazımda en az 2 SPI start beklenirdi!");
+        $display("WRITE_CODE_N_UPD_N tamam. spi_start_count=%0d", spi_start_count);
+
+        spi_start_count = 0;
+        send_msg_expect(CMD_UPDATE_ALL, 8'h00, 16'h0000, 0, 2000);
+        if (spi_start_count < 1) $fatal("UPDATE_ALL sonrası en az 1 SPI start beklenirdi!");
+        $display("UPDATE_ALL tamam.");
+
+        $display("\n=== SCENARYO 4: ILLEGAL – WRITE_CODE_N_UPD_ALL için mask multi-bit ===");
+        spi_start_count = 0;
+        send_msg_expect(CMD_WRITE_CODE_N_UPD_ALL, 8'b0000_0011, 16'h8000, /*illegal*/1, 2000);
+        // illegal’da controller SPI başlatmayabilir
+        if (spi_start_count != 0) $display("Uyarı: illegal durumda SPI start sayısı = %0d (0 beklenebilirdi)", spi_start_count);
+        if (!err_illegal_w) $fatal("err_illegal_w bekleniyordu!");
+        // sticky olmayan bir flag; DONE sonrası düşer (biz anında kontrol ettik)
+
+        $display("\n=== SCENARYO 5: ECHO hata enjekte (model 5. DONE'da bozuyor) ===");
+        // Birkaç kısa komut gönderelim; en az 5 DONE üretelim ki bozma tetiklensin
+        spi_start_count = 0;
+        send_msg_expect(CMD_NOOP, 8'h00, 16'h0000, 0, 2000);
+        send_msg_expect(CMD_NOOP, 8'h00, 16'h0000, 0, 2000);
+        send_msg_expect(CMD_NOOP, 8'h00, 16'h0000, 0, 2000);
+        send_msg_expect(CMD_NOOP, 8'h00, 16'h0000, 0, 2000);
+        send_msg_expect(CMD_NOOP, 8'h00, 16'h0000, 0, 2000); // burada echo bozulmuş olmalı
+        if (!err_echo_w) $fatal("err_echo_w set olmalıydı (echo bozma).");
+        $display("ECHO hatası görüldü → şimdi temizleniyor...");
+        pulse_clear_errors();
+        if (err_echo_w) $fatal("clear_errors sonrası err_echo_w temizlenmedi!");
+        $display("ECHO hata temizlendi.");
+
+        $display("\n=== SCENARYO 6: CLR darbesi (LOW süresi doğrulama) ===");
+        pulse_clr(); // CLR_PULSE_CC = 4 clock
+        // clr_low_count raporu üstteki always bloğundan gelecek
+        // küçük bekleme
+        repeat(10) @(posedge clk_r);
+
+        $display("\n=== SCENARYO 7: OVRTMP düşen kenar (IRQ + sticky) ve temizleme ===");
+        ovrtmp_in_r <= 1'b1; @(posedge clk_r);
+        ovrtmp_in_r <= 1'b0; @(posedge clk_r); // falling edge
+        if (!ovrtmp_irq_w)   $fatal("OVRTMP IRQ pulse bekleniyordu!");
+        if (!ovrtmp_sticky_w)$fatal("OVRTMP sticky bekleniyordu!");
+        pulse_clear_errors();
+        if (ovrtmp_sticky_w) $fatal("OVRTMP sticky temizlenmedi!");
+        $display("OVRTMP IRQ & sticky çalıştı, temizlendi.");
+
+        $display("\n=== TÜM SENARYOLAR BAŞARILI ===");
+        #(200*CLK_PERIOD);
+        $finish;
+    end
+endmodule
