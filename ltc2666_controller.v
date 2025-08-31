@@ -365,3 +365,422 @@ module ltc2666_controller #(
         end
     end
 endmodule
+/*-/*-/*/-*/*-/*-
+//==============================================================================
+//  File   : ltc2666_controller_single.v
+//  Amaç   : LTC2666 için tek modül controller (içinde SPI Master instantiation)
+//           - Açılış/RESET/CLR sonrası oto-init: CONFIG + SPAN(±2.5V, CH0..CH7)
+//           - Echo doğrulaması (init sonunda TEK iç NOOP; RUN'da NOOP YOK)
+//           - CPU'dan gelen tekil kanal/16-bit kod komutlarını sürme
+//           - IN_RANGE koruması: ±ALLOWED_MV dışındaki kodları sürme (drop + flag)
+//  Notlar : * Tüm state/karar/çıkış TEK clocked blokta (combinational yok)
+//           * Active-low uçlar `_al` sonekli (rst_al_i, cs_al, clr_al, ovrtmp_al)
+//           * İç sinyaller *_r sonekli coding standardına uygun
+//==============================================================================
+
+`timescale 1ns/1ps
+module ltc2666_controller_single #(
+    // Sistem/saat
+    parameter integer CLK_HZ                = 100_000_000,
+
+    // SPI
+    parameter integer SPI_SCK_HZ            = 1_000_000,   // 1 MHz
+    parameter integer FRAME_BITS            = 32,          // 24 veya 32 (echo için 32 önerilir)
+
+    // Init / Retry
+    // INIT_RETRY_MAX=0 => SINIRSIZ tekrar dene (başarana kadar)
+    parameter integer INIT_RETRY_MAX        = 0,
+
+    // CLR darbe süresi (clock sayısı)
+    parameter integer CLR_PULSE_CC          = 8,
+
+    // Soft-span sabiti (±2.5V için data=0x0004; datasheet)
+    parameter [15:0]  SOFTSPAN_CODE         = 16'h0004,
+
+    // IN_RANGE koruması (mV), span = ±2500 mV varsayımı
+    parameter integer SPAN_MV               = 2500,
+    parameter integer ALLOWED_MV            = 1500,
+
+    // Kod eşikleri (Offset-Binary)
+    parameter [15:0]  CODE_ZERO             = 16'h8000, // 0V
+    parameter [15:0]  CODE_POS_FS           = 16'hFFFF, // +FS
+    parameter [15:0]  CODE_NEG_FS           = 16'h0000  // -FS
+)(
+    // Saat/Reset (aktif-düşük)
+    input  clk_i,
+    input  rst_al_i,
+
+    // CPU komutu: 1-clk yaz palsi (handshake yok)
+    input              cmd_we_i,        // 1: bu clock'ta yaz
+    input      [2:0]   cmd_chan_i,      // 0..7
+    input      [15:0]  cmd_code_i,      // LTC2666 16-bit ham kod (Offset-Binary)
+
+    // Kontrol
+    input              clr_req_i,       // 1-clk: CLR pinini low yap + oto-init
+    input              start_init_i,    // 1-clk: manuel init tetik
+    input              clear_errors_i,  // sticky bayrakları temizle
+
+    // Donanım alarm (harici I/O expander'dan, aktif-düşük)
+    input              ovrtmp_al_i,     // 0: aşırı sıcak alarm
+
+    // Durum / hatalar
+    output             busy_o,                 // init veya SPI aktifken 1
+    output             inited_o,               // init tamam ve doğrulama OK
+    output             conf_readback_error_o,  // init boyunca 1; başarıyla bitince 0
+    output             init_failed_o,          // (yalnız sınırlı retry modunda) denemeler biterse 1
+    output             echo_error_o,           // echo uyuşmazlığı (sticky)
+    output             in_range_error_o,       // izinli aralık dışı komut geldi (sticky)
+    output             ovrtmp_sticky_o,        // overtemp sticky
+
+    // Debug (opsiyonel)
+    output     [31:0]  last_tx_o,
+    output     [31:0]  last_rx_o,
+
+    // LTC2666 SPI hatları (aktif-düşük CS)
+    output             spi_sclk_o,
+    output             spi_mosi_o,
+    input              spi_miso_i,
+    output             spi_cs_al_o,
+
+    // LTC2666 CLR (aktif-düşük)
+    output             ltc_clr_al_o
+);
+
+    //--------------------------------------------------------------------------
+    // Komut nibble’ları
+    //--------------------------------------------------------------------------
+    localparam [3:0] CMD_WRITE_CODE_N           = 4'b0000;
+    localparam [3:0] CMD_UPDATE_N               = 4'b0001;
+    localparam [3:0] CMD_WRITE_CODE_N_UPD_N     = 4'b0011;
+    localparam [3:0] CMD_WRITE_SPAN_N           = 4'b0110;
+    localparam [3:0] CMD_CONFIG                 = 4'b0111;
+    localparam [3:0] CMD_NOOP                   = 4'b1111;
+
+    //--------------------------------------------------------------------------
+    // IN_RANGE eşikleri (Offset-Binary)
+    //--------------------------------------------------------------------------
+    localparam integer CODE_HALF_RANGE = (CODE_POS_FS > CODE_ZERO) ? (CODE_POS_FS - CODE_ZERO)
+                                                                   : (CODE_ZERO - CODE_POS_FS);
+    localparam integer ALLOWED_DELTA_CODE = (ALLOWED_MV * CODE_HALF_RANGE) / SPAN_MV;
+    localparam [15:0]  CODE_MIN_ALLOWED = CODE_ZERO - ALLOWED_DELTA_CODE[15:0];
+    localparam [15:0]  CODE_MAX_ALLOWED = CODE_ZERO + ALLOWED_DELTA_CODE[15:0];
+
+    // 24/32-bit çerçeveyi 32-bit'e pad'ler (karşılaştırma kolaylığı)
+    function [31:0] frame_f;
+        input [3:0]  cmd;
+        input [3:0]  addr;
+        input [15:0] data;
+        begin
+            frame_f = {8'h00, cmd, addr, data}; // 24'te de üst 8 bit 0
+        end
+    endfunction
+
+    //--------------------------------------------------------------------------
+    // İç sinyaller (*_r)
+    //--------------------------------------------------------------------------
+    // Tek girişlik komut tamponu
+    reg        pend_valid_r;
+    reg [2:0]  pend_chan_r;
+    reg [15:0] pend_code_r;
+
+    // CLR kontrolü (aktif-düşük çıkış)
+    reg        clr_busy_r;
+    reg [15:0] clr_cnt_r;
+    reg        ltc_clr_al_r;  assign ltc_clr_al_o = ltc_clr_al_r;
+
+    // SPI master arayüzü
+    reg         spi_start_r;
+    reg  [31:0] spi_tx_r;
+    wire [31:0] spi_rx_w;
+    wire        spi_done_w;
+    wire        spi_busy_w;
+
+    // Echo takibi
+    reg         have_prev_r;
+    reg  [31:0] prev_tx_r;
+    reg  [31:0] last_rx_r, last_tx_r;
+    assign last_rx_o = last_rx_r;
+    assign last_tx_o = last_tx_r;
+
+    // Hata/state bayrakları
+    reg conf_err_r;         // açılışta 1; init başarıyla bitince 0
+    reg init_ok_r;
+    reg init_failed_r;
+    reg echo_error_r;       // sticky
+    reg in_range_error_r;   // sticky
+
+    // OVRTMP sticky (aktif-düşük giriş)
+    reg ovrtmp_q_r, ovrtmp_sticky_r;
+
+    // Init FSM (tamamen senkron)
+    localparam [3:0]
+        S_RESET     = 4'd0,  // açılış/CLR sonrası
+        S_INIT_CFG  = 4'd1,  // CONFIG gönder
+        S_INIT_SPAN = 4'd2,  // CHn SPAN gönder
+        S_INIT_WAIT = 4'd3,  // DONE bekle (echo işleme)
+        S_INIT_NEXT = 4'd4,  // sonraki adım / kanal ilerlet
+        S_INIT_NOOP = 4'd5,  // init sonu: echo almak için tek NOOP
+        S_RUN_ISSUE = 4'd6,  // çalışma: yazış başlat
+        S_RUN_WAIT  = 4'd7,  // çalışma: DONE + echo kontrol
+        S_RUN_IDLE  = 4'd9;  // normal bekleme
+
+    reg [3:0] init_state_r;
+    reg [2:0] span_chan_r;
+    reg [7:0] retry_left_r; // 0=limitsiz için kullanılmıyor
+
+    // Dış durum
+    assign busy_o                = (init_state_r != S_RUN_IDLE) || spi_busy_w;
+    assign inited_o              = init_ok_r && !conf_err_r;
+    assign conf_readback_error_o = conf_err_r;
+    assign init_failed_o         = init_failed_r;
+    assign echo_error_o          = echo_error_r;
+    assign in_range_error_o      = in_range_error_r;
+    assign ovrtmp_sticky_o       = ovrtmp_sticky_r;
+
+    //==========================================================================
+    // SPI MASTER – kendi çekirdeğinle eşle (port adları uyumluysa direkt çalışır)
+    //==========================================================================
+    spi_master_core #(
+        .CLK_HZ     (CLK_HZ),
+        .SPI_SCK_HZ (SPI_SCK_HZ),
+        .FRAME_BITS (FRAME_BITS)
+    ) u_spi (
+        .clk_i        (clk_i),
+        .rst_al_i     (rst_al_i),
+        .spi_enable_i (spi_start_r),             // 1-clk start
+        .tx_data_i    ( (FRAME_BITS==32) ? spi_tx_r
+                                         : {8'h00, spi_tx_r[23:0]} ), // garanti 32->24 pad
+        .rx_data_o    (spi_rx_w),
+        .data_valid_o (spi_done_w),              // DONE
+        .busy_o       (spi_busy_w),
+        .mosi_o       (spi_mosi_o),
+        .miso_i       (spi_miso_i),
+        .sclk_o       (spi_sclk_o),
+        .cs_al_o      (spi_cs_al_o)              // aktif-düşük CS
+    );
+
+    //==========================================================================
+    // TEK CLOCKED BLOK
+    //==========================================================================
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            // Reset
+            pend_valid_r      <= 1'b0;
+
+            ltc_clr_al_r      <= 1'b1;
+            clr_busy_r        <= 1'b0;
+            clr_cnt_r         <= 16'd0;
+
+            spi_start_r       <= 1'b0;
+            spi_tx_r          <= 32'd0;
+
+            have_prev_r       <= 1'b0;
+            prev_tx_r         <= 32'd0;
+            last_rx_r         <= 32'd0;
+            last_tx_r         <= 32'd0;
+
+            conf_err_r        <= 1'b1;    // init bitene kadar 1
+            init_ok_r         <= 1'b0;
+            init_failed_r     <= 1'b0;
+            echo_error_r      <= 1'b0;
+            in_range_error_r  <= 1'b0;
+
+            ovrtmp_q_r        <= 1'b1;    // aktif-düşük; 1=normal
+            ovrtmp_sticky_r   <= 1'b0;
+
+            init_state_r      <= S_RESET;
+            span_chan_r       <= 3'd0;
+            retry_left_r      <= (INIT_RETRY_MAX==0) ? 8'd0 : INIT_RETRY_MAX[7:0];
+
+        end else begin
+            // ----- clock başı defaultlar
+            spi_start_r <= 1'b0;
+
+            // DONE geldi mi? Echo işleme (her transfer sonrası)
+            if (spi_done_w) begin
+                last_rx_r <= (FRAME_BITS==32) ? spi_rx_w : {8'h00, spi_rx_w[23:0]};
+                last_tx_r <= prev_tx_r; // bir önce yollanan (beklenen echo)
+                if (have_prev_r && ( ((FRAME_BITS==32)?spi_rx_w:{8'h00,spi_rx_w[23:0]}) != prev_tx_r ))
+                    echo_error_r <= 1'b1; // sticky
+                prev_tx_r   <= spi_tx_r;  // bu transferde yollanan sonraki frame için referans
+                have_prev_r <= 1'b1;
+            end
+
+            // Sticky clear
+            if (clear_errors_i) begin
+                echo_error_r      <= 1'b0;
+                in_range_error_r  <= 1'b0;
+                ovrtmp_sticky_r   <= 1'b0;
+                // conf_err_r init akışında düşecek; burada dokunmuyoruz
+            end
+
+            // OVRTMP sticky (aktif-düşük giriş)
+            ovrtmp_q_r <= ovrtmp_al_i;
+            if (ovrtmp_q_r==1'b1 && ovrtmp_al_i==1'b0)
+                ovrtmp_sticky_r <= 1'b1;
+
+            // Tek girişlik komut tamponu (busy'de iken yazılırsa görmezden gelinir)
+            if (cmd_we_i && !pend_valid_r) begin
+                pend_valid_r <= 1'b1;
+                pend_chan_r  <= cmd_chan_i;
+                pend_code_r  <= cmd_code_i;
+            end
+
+            // CLR darbesi (aktif-düşük çıkış) + init’e dön
+            if (clr_req_i && !clr_busy_r) begin
+                clr_busy_r    <= 1'b1;
+                clr_cnt_r     <= CLR_PULSE_CC[15:0];
+                ltc_clr_al_r  <= 1'b0;  // low
+                // init parametreleri
+                init_state_r  <= S_RESET;
+                conf_err_r    <= 1'b1;
+                init_ok_r     <= 1'b0;
+                init_failed_r <= 1'b0;
+                echo_error_r  <= 1'b0;
+                have_prev_r   <= 1'b0;
+                span_chan_r   <= 3'd0;
+                retry_left_r  <= (INIT_RETRY_MAX==0) ? 8'd0 : INIT_RETRY_MAX[7:0];
+            end else if (clr_busy_r) begin
+                if (clr_cnt_r==0) begin
+                    clr_busy_r    <= 1'b0;
+                    ltc_clr_al_r  <= 1'b1;  // high
+                end else begin
+                    clr_cnt_r <= clr_cnt_r - 16'd1;
+                end
+            end
+
+            // Manuel init tetik
+            if (start_init_i) begin
+                init_state_r  <= S_RESET;
+                conf_err_r    <= 1'b1;
+                init_ok_r     <= 1'b0;
+                init_failed_r <= 1'b0;
+                echo_error_r  <= 1'b0;
+                have_prev_r   <= 1'b0;
+                span_chan_r   <= 3'd0;
+                retry_left_r  <= (INIT_RETRY_MAX==0) ? 8'd0 : INIT_RETRY_MAX[7:0];
+            end
+
+            //========================
+            //  FSM — TAMAMEN SENKRON
+            //========================
+            case (init_state_r)
+
+                // ------------------------- Açılış / INIT başlangıç
+                S_RESET: begin
+                    // İlk adım: CONFIG (iç referans + thermal enable; datasheet: RD=0, TS=0)
+                    if (!spi_busy_w && !clr_busy_r) begin
+                        spi_tx_r     <= frame_f(CMD_CONFIG, 4'h0, 16'h0000);
+                        spi_start_r  <= 1'b1;
+                        init_state_r <= S_INIT_WAIT;
+                    end
+                end
+
+                S_INIT_CFG: begin
+                    // Bu state kullanılmıyor; S_RESET doğrudan CONFIG gönderiyor
+                    init_state_r <= S_INIT_WAIT;
+                end
+
+                S_INIT_SPAN: begin
+                    // CHn SPAN: ±2.5V (0x0004)
+                    if (!spi_busy_w) begin
+                        spi_tx_r     <= frame_f(CMD_WRITE_SPAN_N, {1'b0,span_chan_r}, SOFTSPAN_CODE);
+                        spi_start_r  <= 1'b1;
+                        init_state_r <= S_INIT_WAIT;
+                    end
+                end
+
+                S_INIT_WAIT: begin
+                    // DONE gelince echo işlendi ve buradan NEXT'e çıkarız
+                    if (spi_done_w)
+                        init_state_r <= S_INIT_NEXT;
+                end
+
+                S_INIT_NEXT: begin
+                    // Echo hatası → retry / başarısız politikası
+                    if (echo_error_r) begin
+                        if (INIT_RETRY_MAX==0) begin
+                            // sınırsız retry
+                            conf_err_r   <= 1'b1;
+                            init_ok_r    <= 1'b0;
+                            echo_error_r <= 1'b0;
+                            have_prev_r  <= 1'b0;
+                            span_chan_r  <= 3'd0;
+                            init_state_r <= S_RESET;
+                        end else if (retry_left_r != 0) begin
+                            retry_left_r <= retry_left_r - 8'd1;
+                            conf_err_r   <= 1'b1;
+                            init_ok_r    <= 1'b0;
+                            echo_error_r <= 1'b0;
+                            have_prev_r  <= 1'b0;
+                            span_chan_r  <= 3'd0;
+                            init_state_r <= S_RESET;
+                        end else begin
+                            init_failed_r<= 1'b1;
+                            init_state_r <= S_RUN_IDLE; // yine de çalışmaya geç (conf_err 1 kalır)
+                        end
+                    end else begin
+                        // Hangi adımı bitirdik? last_tx_r (beklenen echo) komut nibblesından okunur
+                        if (last_tx_r[23:20]==CMD_CONFIG) begin
+                            // CONFIG → SPAN CH0
+                            span_chan_r  <= 3'd0;
+                            init_state_r <= S_INIT_SPAN;
+                        end else if (last_tx_r[23:20]==CMD_WRITE_SPAN_N) begin
+                            if (span_chan_r < 3'd7) begin
+                                span_chan_r  <= span_chan_r + 3'd1;
+                                init_state_r <= S_INIT_SPAN;
+                            end else begin
+                                // Son SPAN yazıldı → son echo'yu görmek için TEK NOOP
+                                init_state_r <= S_INIT_NOOP;
+                            end
+                        end else if (last_tx_r[23:20]==CMD_NOOP) begin
+                            // Init tamam ve doğrulandı
+                            conf_err_r    <= 1'b0;
+                            init_ok_r     <= 1'b1;
+                            init_state_r  <= S_RUN_IDLE;
+                        end else begin
+                            // CONFIG sonrası ilk S_INIT_WAIT→NEXT geldiyse:
+                            init_state_r  <= S_INIT_SPAN;
+                        end
+                    end
+                end
+
+                S_INIT_NOOP: begin
+                    if (!spi_busy_w) begin
+                        spi_tx_r     <= frame_f(CMD_NOOP, 4'h0, 16'h0000);
+                        spi_start_r  <= 1'b1;
+                        init_state_r <= S_INIT_WAIT;
+                    end
+                end
+
+                // ------------------------- RUN (normal çalışma)
+                S_RUN_IDLE: begin
+                    if (pend_valid_r) begin
+                        // IN_RANGE kontrolü (Offset-Binary)
+                        if ( (pend_code_r < CODE_MIN_ALLOWED) || (pend_code_r > CODE_MAX_ALLOWED) ) begin
+                            in_range_error_r <= 1'b1;   // sticky
+                            pend_valid_r     <= 1'b0;   // komutu düş
+                        end else if (!spi_busy_w) begin
+                            // Tek frame: WRITE_CODE_N_UPD_N
+                            spi_tx_r     <= frame_f(CMD_WRITE_CODE_N_UPD_N, {1'b0,pend_chan_r}, pend_code_r);
+                            spi_start_r  <= 1'b1;
+                            pend_valid_r <= 1'b0;       // komut tüketildi
+                            init_state_r <= S_RUN_WAIT;
+                        end
+                    end
+                end
+
+                S_RUN_WAIT: begin
+                    if (spi_done_w)
+                        init_state_r <= S_RUN_IDLE;    // RUN'da NOOP yok; echo'yu bir sonraki yazışta görürüz
+                end
+
+                default: begin
+                    init_state_r <= S_RESET;
+                end
+            endcase
+        end
+    end
+
+endmodule
+
