@@ -1,0 +1,120 @@
+Evet. En az değişiklikle yapalım.
+
+1) Yeni parametre ekle
+
+Parametrelerin yanına şunu ekle:
+
+parameter CONV_WAIT_US = 20000
+
+
+---
+
+2) Yeni localparam ve sayaç ekle
+
+Timer/localparam tarafına şunları ekle:
+
+localparam CONV_WAIT_CLKS = (((SYS_CLK_FREQ / 1_000_000) * CONV_WAIT_US) > 0) ?
+                            ((SYS_CLK_FREQ / 1_000_000) * CONV_WAIT_US) : 1;
+
+localparam CONV_WAIT_CNT_W = $clog2(CONV_WAIT_CLKS + 1);
+
+Sinyallere şunları ekle:
+
+reg [CONV_WAIT_CNT_W-1:0] conv_wait_cntr_r;
+reg                       conv_wait_en_r;
+reg                       conv_wait_done_r;
+
+
+---
+
+3) Yeni state ekle
+
+State listesine şunu ekle:
+
+S_WAIT_CONVERSION = 5'd13;
+
+
+---
+
+4) Yeni timer always bloğu ekle
+
+tbuf timer bloğuna benzer şekilde şunu ekle:
+
+always @(posedge clk_i or negedge rst_al_i) begin
+    if (!rst_al_i) begin
+        conv_wait_cntr_r <= {CONV_WAIT_CNT_W{1'b0}};
+        conv_wait_done_r <= 1'b0;
+    end
+    else begin
+        conv_wait_done_r <= 1'b0;
+
+        if (conv_wait_en_r) begin
+            if (conv_wait_cntr_r == CONV_WAIT_CLKS - 1) begin
+                conv_wait_cntr_r <= {CONV_WAIT_CNT_W{1'b0}};
+                conv_wait_done_r <= 1'b1;
+            end
+            else begin
+                conv_wait_cntr_r <= conv_wait_cntr_r + {{(CONV_WAIT_CNT_W-1){1'b0}}, 1'b1};
+            end
+        end
+        else begin
+            conv_wait_cntr_r <= {CONV_WAIT_CNT_W{1'b0}};
+        end
+    end
+end
+
+
+---
+
+5) FSM default kısmına ekle
+
+Main FSM başındaki defaultlara şunu ekle:
+
+conv_wait_en_r = 1'b0;
+
+
+---
+
+6) Geçişi değiştir
+
+Az önce değiştirdiğin yerde, yani S_TBUF_AFTER_ID içinde:
+
+şu satır:
+
+next_state_r = S_INIT_CFG_READ;
+
+yerine şunu yap:
+
+next_state_r = S_WAIT_CONVERSION;
+
+
+---
+
+7) Yeni state bloğunu ekle
+
+S_TBUF_AFTER_ID ile S_INIT_CFG_READ arasına koyabilirsin:
+
+S_WAIT_CONVERSION: begin
+    conv_wait_en_r = 1'b1;
+    if (conv_wait_done_r) begin
+        reset_busy_cntr_r = 1'b1;
+        next_state_r      = S_INIT_CFG_READ;
+    end
+end
+
+
+---
+
+Sonuç
+
+Böylece:
+
+ID okunduktan sonra
+
+sensöre ilk conversion için ~20 ms süre verilecek
+
+sonra config poll yapılacak
+
+
+İlk deneme için 20000 us iyi.
+İstersen sonra 16000 us veya 18000 us yaparsın.
