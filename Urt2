@@ -1,0 +1,242 @@
+//-------------------------------------------------------------------------
+// top_tmp117_uart_2sensor_raw.v
+//
+// 2 adet TMP117 verisini UART'tan raw hex olarak yollar.
+//
+// UART format:
+//   S0:XXXX\r\n
+//   S1:XXXX\r\n
+//
+// Ornek:
+//   S0:0CD1
+//   S1:0CB4
+//
+// Not:
+// - TMP117 raw degeri signed 16-bit two's complement'tir.
+// - Sicaklik (C) = signed_raw / 128
+//-------------------------------------------------------------------------
+
+module top_tmp117_uart_2sensor_raw
+#(
+    parameter CLK_HZ  = 50_000_000,
+    parameter I2C_HZ  = 100_000,
+    parameter BAUD    = 115_200
+)
+(
+    input clk_i,
+    input rst_al_i,
+
+    inout sda_io,
+    inout scl_io,
+
+    output uart_tx_o,
+
+    output led_s0_dv_o,
+    output led_s1_dv_o,
+    output led_ackerr_o
+);
+
+    // --------------------------------------------------------------------
+    // TMP117 controller
+    // --------------------------------------------------------------------
+    wire        s0_dv_w;
+    wire [15:0] s0_raw_w;
+    wire        s0_iderr_w;
+    wire        s0_cfgerr_w;
+    wire        s0_ackerr_w;
+    wire        s0_rngerr_w;
+
+    wire        s1_dv_w;
+    wire [15:0] s1_raw_w;
+    wire        s1_iderr_w;
+    wire        s1_cfgerr_w;
+    wire        s1_ackerr_w;
+    wire        s1_rngerr_w;
+
+    tmp117_controller #(
+        .SYS_CLK_FREQ      (CLK_HZ),
+        .I2C_BUS_CLK_FREQ  (I2C_HZ),
+        .TBUF_US           (2),
+        .POWERUP_WAIT_US   (1500),
+        .CONV_WAIT_US      (20000),
+        .NUM_SENSORS       (2),
+        .DEVICE_ADDR_0     (7'h48), // ADDR = GND
+        .DEVICE_ADDR_1     (7'h49), // ADDR = V+
+        .CFG_MOD_P         (2'b00),
+        .CFG_CONV_P        (3'b000),
+        .CFG_AVG_P         (2'b00)
+    ) u_tmp117_controller (
+        .clk_i                   (clk_i),
+        .rst_al_i                (rst_al_i),
+        .tmp117_scl_io           (scl_io),
+        .tmp117_sda_io           (sda_io),
+
+        .tmp117_s0_data_valid_o  (s0_dv_w),
+        .tmp117_s0_data_raw_o    (s0_raw_w),
+        .tmp117_s0_id_error_o    (s0_iderr_w),
+        .tmp117_s0_cfg_error_o   (s0_cfgerr_w),
+        .tmp117_s0_ack_error_o   (s0_ackerr_w),
+        .tmp117_s0_range_error_o (s0_rngerr_w),
+
+        .tmp117_s1_data_valid_o  (s1_dv_w),
+        .tmp117_s1_data_raw_o    (s1_raw_w),
+        .tmp117_s1_id_error_o    (s1_iderr_w),
+        .tmp117_s1_cfg_error_o   (s1_cfgerr_w),
+        .tmp117_s1_ack_error_o   (s1_ackerr_w),
+        .tmp117_s1_range_error_o (s1_rngerr_w)
+    );
+
+    // --------------------------------------------------------------------
+    // UART TX
+    // --------------------------------------------------------------------
+    wire      tx_busy_w;
+    wire      tx_done_w;
+    reg       tx_start_r;
+    reg [7:0] tx_data_r;
+
+    uart_tx #(
+        .CLK_FREQ   (CLK_HZ),
+        .BAUDRATE   (BAUD),
+        .DATA_WIDTH (8),
+        .STOP_BIT   (1)
+    ) u_uart_tx (
+        .clk_i      (clk_i),
+        .rst_al_i   (rst_al_i),
+        .tx_data_i  (tx_data_r),
+        .tx_start_i (tx_start_r),
+        .tx_busy_o  (tx_busy_w),
+        .tx_done_o  (tx_done_w),
+        .tx_o       (uart_tx_o)
+    );
+
+    // --------------------------------------------------------------------
+    // Debug LED latch
+    // --------------------------------------------------------------------
+    reg s0_dv_latch_r;
+    reg s1_dv_latch_r;
+    reg ackerr_latch_r;
+
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            s0_dv_latch_r  <= 1'b0;
+            s1_dv_latch_r  <= 1'b0;
+            ackerr_latch_r <= 1'b0;
+        end
+        else begin
+            if (s0_dv_w) begin
+                s0_dv_latch_r <= 1'b1;
+            end
+
+            if (s1_dv_w) begin
+                s1_dv_latch_r <= 1'b1;
+            end
+
+            if (s0_ackerr_w || s1_ackerr_w) begin
+                ackerr_latch_r <= 1'b1;
+            end
+        end
+    end
+
+    assign led_s0_dv_o  = s0_dv_latch_r;
+    assign led_s1_dv_o  = s1_dv_latch_r;
+    assign led_ackerr_o = ackerr_latch_r;
+
+    // --------------------------------------------------------------------
+    // Pending sample buffer
+    // --------------------------------------------------------------------
+    reg        pend_s0_r;
+    reg        pend_s1_r;
+    reg [15:0] pend_s0_raw_r;
+    reg [15:0] pend_s1_raw_r;
+
+    // --------------------------------------------------------------------
+    // Formatter helpers
+    // --------------------------------------------------------------------
+    function [7:0] hex_ascii;
+        input [3:0] d;
+        begin
+            if (d < 4'd10) begin
+                hex_ascii = 8'd48 + d;
+            end
+            else begin
+                hex_ascii = 8'd55 + d;
+            end
+        end
+    endfunction
+
+    // --------------------------------------------------------------------
+    // UART formatter / sender control
+    // --------------------------------------------------------------------
+    reg        fmt_run_r;
+    reg [3:0]  step_r;
+    reg        sensor_sel_r; // 0 -> S0, 1 -> S1
+    reg [15:0] raw_sel_r;
+
+    // Pending bayraklari ve formatter secimi tek always blokta yonetiliyor
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            pend_s0_r     <= 1'b0;
+            pend_s1_r     <= 1'b0;
+            pend_s0_raw_r <= 16'h0000;
+            pend_s1_raw_r <= 16'h0000;
+
+            fmt_run_r     <= 1'b0;
+            step_r        <= 4'd0;
+            tx_start_r    <= 1'b0;
+            tx_data_r     <= 8'h00;
+            sensor_sel_r  <= 1'b0;
+            raw_sel_r     <= 16'h0000;
+        end
+        else begin
+            tx_start_r <= 1'b0;
+
+            // Yeni sample capture
+            if (s0_dv_w) begin
+                pend_s0_r     <= 1'b1;
+                pend_s0_raw_r <= s0_raw_w;
+            end
+
+            if (s1_dv_w) begin
+                pend_s1_r     <= 1'b1;
+                pend_s1_raw_r <= s1_raw_w;
+            end
+
+            // Yeni mesaj baslat
+            if (!fmt_run_r) begin
+                if (pend_s0_r) begin
+                    fmt_run_r    <= 1'b1;
+                    step_r       <= 4'd0;
+                    sensor_sel_r <= 1'b0;
+                    raw_sel_r    <= pend_s0_raw_r;
+                    pend_s0_r    <= 1'b0;
+                end
+                else if (pend_s1_r) begin
+                    fmt_run_r    <= 1'b1;
+                    step_r       <= 4'd0;
+                    sensor_sel_r <= 1'b1;
+                    raw_sel_r    <= pend_s1_raw_r;
+                    pend_s1_r    <= 1'b0;
+                end
+            end
+
+            // UART byte gonder
+            if (fmt_run_r && !tx_busy_w) begin
+                case (step_r)
+                    4'd0: begin tx_data_r <= 8'h53; tx_start_r <= 1'b1; step_r <= 4'd1; end // 'S'
+                    4'd1: begin tx_data_r <= sensor_sel_r ? 8'h31 : 8'h30; tx_start_r <= 1'b1; step_r <= 4'd2; end // '1'/'0'
+                    4'd2: begin tx_data_r <= 8'h3A; tx_start_r <= 1'b1; step_r <= 4'd3; end // ':'
+                    4'd3: begin tx_data_r <= hex_ascii(raw_sel_r[15:12]); tx_start_r <= 1'b1; step_r <= 4'd4; end
+                    4'd4: begin tx_data_r <= hex_ascii(raw_sel_r[11:8 ]); tx_start_r <= 1'b1; step_r <= 4'd5; end
+                    4'd5: begin tx_data_r <= hex_ascii(raw_sel_r[7 :4 ]); tx_start_r <= 1'b1; step_r <= 4'd6; end
+                    4'd6: begin tx_data_r <= hex_ascii(raw_sel_r[3 :0 ]); tx_start_r <= 1'b1; step_r <= 4'd7; end
+                    4'd7: begin tx_data_r <= 8'h0D; tx_start_r <= 1'b1; step_r <= 4'd8; end // CR
+                    4'd8: begin tx_data_r <= 8'h0A; tx_start_r <= 1'b1; step_r <= 4'd9; end // LF
+                    default: begin
+                        fmt_run_r <= 1'b0;
+                    end
+                endcase
+            end
+        end
+    end
+
+endmodule
