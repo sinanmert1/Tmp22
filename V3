@@ -1,0 +1,240 @@
+Aşağıya direkt yapıştırılabilir final blokları bırakıyorum. Bunlar, senin son çalışan sürümündeki sorunları kapatan nihai düzeltmeler.
+
+1) READ BYTE / WORD ASSEMBLY bloğunu değiştir
+
+Eski blokta rd_word_r kullanıyorduk. Artık buna gerek yok.
+Bu bloğu şununla değiştir:
+
+// =========================================================================
+// READ BYTE ASSEMBLY
+// =========================================================================
+always @(posedge clk_i or negedge rst_al_i) begin
+    if (!rst_al_i) begin
+        rd_msb_r <= 8'h00;
+    end
+    else begin
+        // First read byte completed
+        if ((busy_prev_r == 1'b1) && (busy_w == 1'b0)) begin
+            case (state_r)
+                S_INIT_ID_READ,
+                S_INIT_CFG_READ,
+                S_POLL_CFG_READ,
+                S_TEMP_READ: begin
+                    if (busy_cntr_r == 3'd2) begin
+                        rd_msb_r <= data_rd_w;
+                    end
+                end
+
+                default: begin
+                end
+            endcase
+        end
+    end
+end
+
+
+---
+
+2) PER-SENSOR DATA / STATUS REGISTERS bloğunu değiştir
+
+Bu blokta:
+
+ID error
+
+CFG error
+
+TEMP update hepsi artık {rd_msb_r, data_rd_w} ile yapılacak.
+
+
+Bu bloğun ilgili kısmını komple bununla değiştir:
+
+// =========================================================================
+// PER-SENSOR DATA / STATUS REGISTERS
+// =========================================================================
+always @(posedge clk_i or negedge rst_al_i) begin
+    if (!rst_al_i) begin
+        for (i_r = 0; i_r < 2; i_r = i_r + 1) begin
+            init_done_r[i_r]    <= 1'b0;
+            temp_r[i_r]         <= 16'h0000;
+            data_valid_r[i_r]   <= 1'b0;
+            id_error_r[i_r]     <= 1'b0;
+            cfg_error_r[i_r]    <= 1'b0;
+            ack_error_r[i_r]    <= 1'b0;
+            range_error_r[i_r]  <= 1'b0;
+        end
+    end
+    else begin
+        // data_valid is a 1-clock pulse
+        data_valid_r[0] <= 1'b0;
+        data_valid_r[1] <= 1'b0;
+
+        // Sticky ACK error for active sensor
+        if ((busy_prev_r == 1'b1) && (busy_w == 1'b0) && ack_error_w) begin
+            if (sensor_sel_r == 1'b0) begin
+                ack_error_r[0] <= 1'b1;
+            end
+            else begin
+                ack_error_r[1] <= 1'b1;
+            end
+        end
+
+        // State-based completion handling
+        if ((busy_prev_r == 1'b1) && (busy_w == 1'b0)) begin
+            case (state_r)
+
+                // ---------------------------------------------------------
+                // Device ID read completed
+                // ---------------------------------------------------------
+                S_INIT_ID_READ: begin
+                    if (busy_cntr_r == 3'd3) begin
+                        if (sensor_sel_r == 1'b0) begin
+                            id_error_r[0] <= ({rd_msb_r, data_rd_w} != EXPECT_DEVICE_ID);
+                        end
+                        else begin
+                            id_error_r[1] <= ({rd_msb_r, data_rd_w} != EXPECT_DEVICE_ID);
+                        end
+                    end
+                end
+
+                // ---------------------------------------------------------
+                // Config readback completed
+                // ---------------------------------------------------------
+                S_INIT_CFG_READ: begin
+                    if (busy_cntr_r == 3'd3) begin
+                        if (sensor_sel_r == 1'b0) begin
+                            cfg_error_r[0] <= ((({rd_msb_r, data_rd_w}) & CFG_COMPARE_MASK) !=
+                                               (CFG_WRITE_VALUE & CFG_COMPARE_MASK));
+                            init_done_r[0] <= 1'b1;
+                        end
+                        else begin
+                            cfg_error_r[1] <= ((({rd_msb_r, data_rd_w}) & CFG_COMPARE_MASK) !=
+                                               (CFG_WRITE_VALUE & CFG_COMPARE_MASK));
+                            init_done_r[1] <= 1'b1;
+                        end
+                    end
+                end
+
+                // ---------------------------------------------------------
+                // Temperature read completed
+                // data_valid and temp update occur in the same clock
+                // ---------------------------------------------------------
+                S_TEMP_READ: begin
+                    if (busy_cntr_r == 3'd3) begin
+                        if ($signed({rd_msb_r, data_rd_w}) >= $signed(TEMP_THRESHOLD_LOW) &&
+                            $signed({rd_msb_r, data_rd_w}) <= $signed(TEMP_THRESHOLD_HIGH)) begin
+
+                            if (sensor_sel_r == 1'b0) begin
+                                temp_r[0]        <= {rd_msb_r, data_rd_w};
+                                data_valid_r[0]  <= 1'b1;
+                                range_error_r[0] <= 1'b0;
+                            end
+                            else begin
+                                temp_r[1]        <= {rd_msb_r, data_rd_w};
+                                data_valid_r[1]  <= 1'b1;
+                                range_error_r[1] <= 1'b0;
+                            end
+                        end
+                        else begin
+                            if (sensor_sel_r == 1'b0) begin
+                                range_error_r[0] <= 1'b1;
+                            end
+                            else begin
+                                range_error_r[1] <= 1'b1;
+                            end
+                        end
+                    end
+                end
+
+                default: begin
+                end
+            endcase
+        end
+    end
+end
+
+
+---
+
+3) S_WAIT_CONVERSION bloğu final hali
+
+Bunu finalde CFG_WRITE’a döndür:
+
+S_WAIT_CONVERSION: begin
+    conv_wait_en_r = 1'b1;
+    if (conv_wait_done_r) begin
+        reset_busy_cntr_r = 1'b1;
+        next_state_r      = S_INIT_CFG_WRITE;
+    end
+end
+
+
+---
+
+4) S_POLL_CFG_READ içindeki 3'd3 kısmını final hale getir
+
+Geçici zorla S_TEMP_READ geçişini kaldır.
+Şu final blok kalsın:
+
+3'd3: begin
+    if (busy_w == 1'b0) begin
+        reset_busy_cntr_r = 1'b1;
+
+        // Data_Ready = configuration register bit[13]
+        // This is bit[5] of the MSB byte
+        if (rd_msb_r[5] == 1'b1) begin
+            next_state_r = S_TEMP_READ;
+        end
+        else begin
+            next_state_r = S_TBUF_AFTER_POLL;
+        end
+    end
+end
+
+
+---
+
+5) rd_word_r declaration’ını kaldır
+
+Sinyaller kısmında varsa bunu sil:
+
+reg [15:0] rd_word_r;
+
+
+---
+
+6) Reset/state bloğundan rd_word_r resetini kaldır
+
+Şu tip bir satır varsa sil:
+
+rd_word_r <= 16'h0000;
+
+
+---
+
+7) READ BYTE / WORD ASSEMBLY başlığını da güncelle
+
+İstersen yorum olarak şuna çevir:
+
+// =========================================================================
+// READ BYTE ASSEMBLY
+// MSB is captured after first read byte completes.
+// Final compare / commit uses {rd_msb_r, data_rd_w} directly.
+// =========================================================================
+
+
+---
+
+Son kontrol listesi
+
+Bunları yaptıktan sonra final davranış şu olmalı:
+
+ID read doğru
+
+CFG write/readback doğru
+
+Poll sırasında rd_msb_r[5] ile Data_Ready kontrolü
+
+Temp read sonunda sıcaklık {rd_msb_r, data_rd_w} ile commit
+
+UART raw testte 0220 değil gerçek sıcaklık hex’i görünmeli
+
