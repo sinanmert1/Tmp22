@@ -1,0 +1,156 @@
+// -----------------------------------------------------------------------------
+// Init next sensor
+// Every enabled sensor is tried up to INIT_RTRY_MAX_COUNT times.
+// If current sensor cannot be initialized after max retry count,
+// controller switches to the other sensor.
+// Runtime is entered only if at least one sensor is initialized successfully.
+// -----------------------------------------------------------------------------
+S_INIT_NEXT_SENSOR: begin
+    reset_busy_cntr_r <= 1'b1;
+
+    // ---------------------------------------------------------
+    // If any sensor is initialized successfully, runtime can start
+    // ---------------------------------------------------------
+    if ((init_done_r[0] == 1'b1 && cfg_error_r[0] == 1'b0) ||
+        ((NUM_SENSORS == 2) &&
+         (init_done_r[1] == 1'b1 && cfg_error_r[1] == 1'b0))) begin
+
+        init_rtry_count_r <= 4'd0;
+
+        // Runtime starts from the initialized sensor
+        if (init_done_r[0] == 1'b1 && cfg_error_r[0] == 1'b0) begin
+            sensor_sel_r <= 1'b0;
+        end else begin
+            sensor_sel_r <= 1'b1;
+        end
+
+        state_r <= S_POLL_CFG_READ;
+    end
+
+    // ---------------------------------------------------------
+    // No sensor is initialized yet
+    // Try selected sensor up to INIT_RTRY_MAX_COUNT times
+    // ---------------------------------------------------------
+    else begin
+
+        // Same sensor retry
+        if (init_rtry_count_r < INIT_RTRY_MAX_COUNT) begin
+            init_rtry_count_r <= init_rtry_count_r + 1'b1;
+
+            init_done_r[sensor_sel_r] <= 1'b0;
+
+            // Optional but usually cleaner before a new init attempt
+            cfg_error_r[sensor_sel_r] <= 1'b0;
+
+            state_r <= S_INIT_ID_READ;
+        end
+
+        // Retry limit reached for selected sensor
+        // Switch to the other sensor
+        else begin
+
+            // First attempt of next sensor is being started now,
+            // therefore retry counter becomes 1, not 0.
+            init_rtry_count_r <= 4'd1;
+
+            if (NUM_SENSORS == 2) begin
+
+                if (sensor_sel_r == 1'b0) begin
+                    sensor_sel_r       <= 1'b1;
+                    init_done_r[1]     <= 1'b0;
+                    cfg_error_r[1]     <= 1'b0;
+                end else begin
+                    sensor_sel_r       <= 1'b0;
+                    init_done_r[0]     <= 1'b0;
+                    cfg_error_r[0]     <= 1'b0;
+                end
+
+                state_r <= S_INIT_ID_READ;
+            end
+
+            // Single sensor case:
+            // keep trying sensor 0 forever until it initializes
+            else begin
+                sensor_sel_r       <= 1'b0;
+                init_done_r[0]     <= 1'b0;
+                cfg_error_r[0]     <= 1'b0;
+
+                state_r <= S_INIT_ID_READ;
+            end
+        end
+    end
+end
+
+
+00000
+// -----------------------------------------------------------------------------
+// Round-robin runtime scheduler
+// Only initialized sensors are selected during runtime.
+// If both sensors are initialized, scheduler runs round-robin.
+// If only one sensor is initialized, scheduler keeps reading that sensor.
+// -----------------------------------------------------------------------------
+S_RUNTIME_NEXT_SENSOR: begin
+    reset_busy_cntr_r <= 1'b1;
+
+    if (NUM_SENSORS == 2) begin
+
+        // -----------------------------------------------------
+        // Both sensors are initialized
+        // Runtime can run as round-robin
+        // -----------------------------------------------------
+        if ((init_done_r[0] == 1'b1 && cfg_error_r[0] == 1'b0) &&
+            (init_done_r[1] == 1'b1 && cfg_error_r[1] == 1'b0)) begin
+
+            sensor_sel_r <= ~sensor_sel_r;
+            state_r      <= S_POLL_CFG_READ;
+        end
+
+        // -----------------------------------------------------
+        // Only sensor 0 is initialized
+        // Keep reading sensor 0
+        // -----------------------------------------------------
+        else if (init_done_r[0] == 1'b1 && cfg_error_r[0] == 1'b0) begin
+
+            sensor_sel_r <= 1'b0;
+            state_r      <= S_POLL_CFG_READ;
+        end
+
+        // -----------------------------------------------------
+        // Only sensor 1 is initialized
+        // Keep reading sensor 1
+        // -----------------------------------------------------
+        else if (init_done_r[1] == 1'b1 && cfg_error_r[1] == 1'b0) begin
+
+            sensor_sel_r <= 1'b1;
+            state_r      <= S_POLL_CFG_READ;
+        end
+
+        // -----------------------------------------------------
+        // No initialized sensor exists.
+        // This should not normally happen in runtime.
+        // Go back to init flow.
+        // -----------------------------------------------------
+        else begin
+
+            sensor_sel_r <= 1'b0;
+            state_r      <= S_INIT_NEXT_SENSOR;
+        end
+    end
+
+    else begin
+
+        // -----------------------------------------------------
+        // Single sensor design
+        // Runtime is allowed only if sensor 0 is initialized
+        // -----------------------------------------------------
+        if (init_done_r[0] == 1'b1 && cfg_error_r[0] == 1'b0) begin
+
+            sensor_sel_r <= 1'b0;
+            state_r      <= S_POLL_CFG_READ;
+        end else begin
+
+            sensor_sel_r <= 1'b0;
+            state_r      <= S_INIT_NEXT_SENSOR;
+        end
+    end
+end
