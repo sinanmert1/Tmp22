@@ -18,6 +18,7 @@
 //
 // MODULE DESCRIPTION:
 // *******************
+// VERSION: v2 - MUXOUT parameter comments and usage notes clarified.
 // 1- This module is a generic LTC2666 DAC controller for an 8-channel, 16-bit SoftSpan DAC.
 // 2- The controller uses the existing generic spi_master module with SPI_WIDTH = 32.
 // 3- The LTC2666 command format is command[3:0] + address[3:0] + data[15:0].
@@ -58,6 +59,38 @@
 // 7- If FRAME_OVERWRITE_EN = 1'b1, the pending frame is overwritten by the latest received frame.
 // 8- If FRAME_OVERWRITE_EN = 1'b0, receiving a new frame while pending frame is already full
 //    latches frame_overrun_err_o and triggers reconfiguration.
+// *******************
+// MUXOUT CONFIGURATION:
+// *******************
+// 1- The LTC2666 includes an analog multiplexer output named MUXOUT.
+// 2- MUXOUT is not a digital FPGA input/output function. It is an analog monitor output pin.
+// 3- This controller only selects which internal analog signal is routed to the MUXOUT pin.
+// 4- The selected MUXOUT signal must be measured externally, for example by an ADC input or test point.
+// 5- MUXOUT_INIT_EN parameter meaning:
+//      1'b0 : The controller does not send the Analog Mux command during initialization.
+//             MUXOUT remains in the LTC2666 power-up default state: Disabled / Hi-Z.
+//      1'b1 : The controller sends one Analog Mux command during initialization and writes
+//             MUXOUT_INIT_SEL[4:0] into the LTC2666 mux control field M4..M0.
+// 6- MUXOUT_INIT_SEL parameter meaning when MUXOUT_INIT_EN = 1'b1:
+//      5'b00000 : Disabled / Hi-Z
+//      5'b10000 : VOUT0
+//      5'b10001 : VOUT1
+//      5'b10010 : VOUT2
+//      5'b10011 : VOUT3
+//      5'b10100 : VOUT4
+//      5'b10101 : VOUT5
+//      5'b10110 : VOUT6
+//      5'b10111 : VOUT7
+//      5'b11000 : REFLO
+//      5'b11001 : REF
+//      5'b11010 : Temperature Monitor
+//      5'b11011 : V+
+//      5'b11100 : V-
+// 7- Example usage:
+//      .MUXOUT_INIT_EN  (1'b0),     // MUXOUT disabled, no mux command is sent
+//      .MUXOUT_INIT_EN  (1'b1),
+//      .MUXOUT_INIT_SEL (5'b10000)  // route VOUT0 to MUXOUT during initialization
+// 8- The mux is intended for high-impedance monitoring inputs only.
 // *******************
 // ECHO FLUSH STATE:
 // *******************
@@ -122,8 +155,11 @@ module ltc2666_controller #(
     parameter [15:0]    CH7_INIT_CODE           = 16'h8000,             // // Mid-scale code, approximately 0V in bipolar ranges
 
     // Optional init-time MUXOUT configuration
-    parameter           MUXOUT_INIT_EN          = 1'b0,                 // // '1'-configure MUXOUT during init sequence
-    parameter [4:0]     MUXOUT_INIT_SEL         = 5'b00000,             // // MUXOUT selection code, default Disabled/Hi-Z
+    // MUXOUT_INIT_EN = 1'b0: no Analog Mux command is sent; MUXOUT remains Disabled/Hi-Z.
+    // MUXOUT_INIT_EN = 1'b1: one Analog Mux command is sent during init and MUXOUT_INIT_SEL selects the analog monitor source.
+    // MUXOUT_INIT_SEL examples: 5'b00000 Disabled/Hi-Z, 5'b10000 VOUT0, 5'b10111 VOUT7, 5'b11010 Temperature Monitor.
+    parameter           MUXOUT_INIT_EN          = 1'b0,                 // // Init-time MUXOUT enable
+    parameter [4:0]     MUXOUT_INIT_SEL         = 5'b00000,             // // Init-time MUXOUT source select, used only when MUXOUT_INIT_EN = 1'b1
 
     // Optional init-time power-down configuration
     parameter           CH_POWER_DOWN_INIT_EN   = 1'b0,                 // // '1'-power down channels selected by CH_POWER_DOWN_INIT_MASK after init update
@@ -201,9 +237,9 @@ module ltc2666_controller #(
     localparam [3:0] CMD_CONFIG                  = 4'b0111;
     localparam [3:0] CMD_NOP                     = 4'b1111;
 
-    localparam [15:0] CONFIG_DATA = 16'h0000; // // TS=0: thermal shutdown enabled, RD=0: internal reference enabled
+    localparam [15:0] CONFIG_DATA = 16'h0000; // // Config command data[1:0]={TS,RD}; TS=0 thermal shutdown enabled, RD=0 internal reference enabled
 
-    localparam [4:0] MUXOUT_DISABLED = 5'b00000; // // MUXOUT disabled / Hi-Z
+    localparam [4:0] MUXOUT_DISABLED = 5'b00000; // // Mux control code 00000: MUXOUT disabled / Hi-Z, used as the default/power-up equivalent state
 
     // ####################################################################################
     //                                    SIGNALS
@@ -545,11 +581,11 @@ module ltc2666_controller #(
                     end
 
                     S_INIT_MUX: begin
-                        // Optional init-time MUXOUT configuration. Default is disabled/Hi-Z.
+                        // Optional init-time MUXOUT configuration. MUXOUT_INIT_EN=0 means no Analog Mux command is sent; MUXOUT stays Disabled/Hi-Z. MUXOUT_INIT_EN=1 routes MUXOUT_INIT_SEL source to MUXOUT.
                         if (MUXOUT_INIT_EN == 1'b0) begin
                             state <= S_INIT_SPAN;
                         end else if (!spi_wait_r && !spi_busy_w) begin
-                            spi_tx_data_r         <= ltc2666_word(CMD_ANALOG_MUX, 4'h0, {11'b0, MUXOUT_INIT_SEL});
+                            spi_tx_data_r         <= ltc2666_word(CMD_ANALOG_MUX, 4'h0, {11'b0, MUXOUT_INIT_SEL}); // Mux command data[4:0] = MUXOUT_INIT_SEL
                             spi_current_tx_data_r <= ltc2666_word(CMD_ANALOG_MUX, 4'h0, {11'b0, MUXOUT_INIT_SEL});
                             spi_en_r              <= 1'b1;
                             spi_wait_r            <= 1'b1;
