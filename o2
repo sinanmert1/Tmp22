@@ -18,7 +18,7 @@
 //
 // MODULE DESCRIPTION:
 // *******************
-// VERSION: v2 - MUXOUT parameter comments and usage notes clarified.
+// VERSION: v3 - Added S_FAULT_HOLD state for limited configuration retry mode.
 // 1- This module is a generic LTC2666 DAC controller for an 8-channel, 16-bit SoftSpan DAC.
 // 2- The controller uses the existing generic spi_master module with SPI_WIDTH = 32.
 // 3- The LTC2666 command format is command[3:0] + address[3:0] + data[15:0].
@@ -407,24 +407,25 @@ module ltc2666_controller #(
     //#############################################################################
     //                               STATE MACHINE
     //#############################################################################
-    localparam STATE_WIDTH = 17;
-    localparam [STATE_WIDTH-1:0] S_CLR              = 17'd1,     //!1-Clear DAC
-                                   S_WAKEUP           = 17'd2,     //!2-Wait after clear
-                                   S_INIT_NOP         = 17'd4,     //!3-Initialize echo pipeline
-                                   S_INIT_CONFIG      = 17'd8,     //!4-Configure internal reference and thermal shutdown
-                                   S_INIT_MUX         = 17'd16,    //!5-Configure MUXOUT if enabled
-                                   S_INIT_SPAN        = 17'd32,    //!6-Configure channel SoftSpan values
-                                   S_INIT_CODE        = 17'd64,    //!7-Write channel init codes
-                                   S_INIT_UPDATE_ALL  = 17'd128,   //!8-Update all DAC outputs after init code/span writes
-                                   S_INIT_POWER_DOWN  = 17'd256,   //!9-Apply optional init-time power-down commands
-                                   S_INIT_ECHO_FLUSH  = 17'd512,   //!10-Flush echo pipeline after last init command
-                                   S_IDLE             = 17'd1024,  //!11-Wait for a valid frame
-                                   S_FRAME_CAPTURE    = 17'd2048,  //!12-Capture pending frame into active frame
-                                   S_FRAME_WRITE_CODE = 17'd4096,  //!13-Write selected channel codes
-                                   S_FRAME_UPDATE     = 17'd8192,  //!14-Update All in synchronized frame mode
-                                   S_FRAME_PWRUP_WAIT = 17'd16384, //!15-Wait after waking up a powered-down channel/chip
-                                   S_FRAME_ECHO_FLUSH = 17'd32768, //!16-Flush echo pipeline after last frame command
-                                   S_RECONFIG        = 17'd65536; //!17-Reconfiguration control and optional retry limiting
+    localparam STATE_WIDTH = 18;
+    localparam [STATE_WIDTH-1:0] S_CLR              = 18'd1,     //!1-Clear DAC
+                                   S_WAKEUP           = 18'd2,     //!2-Wait after clear
+                                   S_INIT_NOP         = 18'd4,     //!3-Initialize echo pipeline
+                                   S_INIT_CONFIG      = 18'd8,     //!4-Configure internal reference and thermal shutdown
+                                   S_INIT_MUX         = 18'd16,    //!5-Configure MUXOUT if enabled
+                                   S_INIT_SPAN        = 18'd32,    //!6-Configure channel SoftSpan values
+                                   S_INIT_CODE        = 18'd64,    //!7-Write channel init codes
+                                   S_INIT_UPDATE_ALL  = 18'd128,   //!8-Update all DAC outputs after init code/span writes
+                                   S_INIT_POWER_DOWN  = 18'd256,   //!9-Apply optional init-time power-down commands
+                                   S_INIT_ECHO_FLUSH  = 18'd512,   //!10-Flush echo pipeline after last init command
+                                   S_IDLE             = 18'd1024,  //!11-Wait for a valid frame
+                                   S_FRAME_CAPTURE    = 18'd2048,  //!12-Capture pending frame into active frame
+                                   S_FRAME_WRITE_CODE = 18'd4096,  //!13-Write selected channel codes
+                                   S_FRAME_UPDATE     = 18'd8192,  //!14-Update All in synchronized frame mode
+                                   S_FRAME_PWRUP_WAIT = 18'd16384, //!15-Wait after waking up a powered-down channel/chip
+                                   S_FRAME_ECHO_FLUSH = 18'd32768, //!16-Flush echo pipeline after last frame command
+                                   S_RECONFIG         = 18'd65536, //!17-Reconfiguration control and optional retry limiting
+                                   S_FAULT_HOLD       = 18'd131072; //!18-Fault hold after retry limit is reached
 
     reg [STATE_WIDTH-1:0] state /* synthesis syn_encoding = "safe,onehot" */;
 
@@ -918,8 +919,21 @@ module ltc2666_controller #(
                             cfg_retry_cntr_r <= cfg_retry_cntr_r + 1;
                             state            <= S_CLR;
                         end else begin
-                            state <= S_RECONFIG;
+                            state <= S_FAULT_HOLD;
                         end
+                    end
+
+                    S_FAULT_HOLD: begin
+                        // Retry limit has been reached. Keep the controller in a safe hold state.
+                        // No DAC command is transmitted in this state. Only an external reset can restart the controller.
+                        init_done_r         <= 1'b0;
+                        cfg_rb_err_r        <= 1'b1;
+                        active_frame_vld_r  <= 1'b0;
+                        pending_frame_vld_r <= 1'b0;
+                        spi_en_r            <= 1'b0;
+                        spi_wait_r          <= 1'b0;
+                        clr_al_r            <= 1'b1;
+                        state               <= S_FAULT_HOLD;
                     end
 
                     default: begin
