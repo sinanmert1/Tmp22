@@ -1,0 +1,913 @@
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+//
+// MODULE DESCRIPTION:
+// *******************
+// 1- This module is a generic LTC2666 DAC controller for an 8-channel, 16-bit SoftSpan DAC.
+// 2- The controller uses the existing generic spi_master module with SPI_WIDTH = 32.
+// 3- The LTC2666 command format is command[3:0] + address[3:0] + data[15:0].
+// 4- A 32-bit SPI instruction is used as {8-bit don't care, command, address, data}.
+// 5- The LTC2666 SDO pin shifts out the previously transmitted 32-bit instruction.
+// 6- Therefore, all configuration and runtime transactions are verified by SPI echo readback.
+// 7- There is no direct register readback mechanism like an ADC configuration register map;
+//    the safety check in this controller is based on the LTC2666 echo readback pipeline.
+// 8- Internal reference mode is fixed in this controller. External reference selection is not supported.
+// 9- TGP/toggle and LDAC functions are not controlled by this module. They shall be handled by hardware
+//    connections according to the schematic and the LTC2666 datasheet recommendations.
+// 10- CLR is controlled by the FPGA. A low pulse is generated during initialization/reconfiguration.
+// *******************
+// SOFTSPAN CONFIGURATION:
+// *******************
+// 1- Each DAC channel has an independent parameter for SoftSpan selection.
+// 2- SoftSpan code map for 2.5V internal reference:
+//      3'b000 : 0V to 5V
+//      3'b001 : 0V to 10V
+//      3'b010 : +/-5V
+//      3'b011 : +/-10V
+//      3'b100 : +/-2.5V
+// 3- Default SoftSpan is +/-2.5V for all channels.
+// 4- Default init code is 16'h8000 for all channels.
+// 5- In bipolar output ranges, 16'h8000 represents approximately 0V.
+// 6- Do not use 16'h0000 as the default init code for bipolar spans,
+//    because it corresponds to negative full-scale.
+// *******************
+// FRAME UPDATE MODE:
+// *******************
+// 1- The upper layer provides one frame by pulsing frame_vld_i for one clk_i cycle.
+// 2- ch_update_mask_i selects which channels in the frame shall be driven to the DAC.
+// 3- ch_update_mask_i[0] corresponds to CH0 and ch_update_mask_i[7] corresponds to CH7.
+// 4- If FRAME_SYNC_UPDATE_EN = 1'b0, each selected channel is written by Write Code n, Update n.
+// 5- If FRAME_SYNC_UPDATE_EN = 1'b1, selected channels are first written into input registers,
+//    then Update All is transmitted once at the end of the frame.
+// 6- If a new frame arrives while the controller is busy, one pending frame can be buffered.
+// 7- If FRAME_OVERWRITE_EN = 1'b1, the pending frame is overwritten by the latest received frame.
+// 8- If FRAME_OVERWRITE_EN = 1'b0, receiving a new frame while pending frame is already full
+//    latches frame_overrun_err_o and triggers reconfiguration.
+// *******************
+// ECHO FLUSH STATE:
+// *******************
+// 1- The LTC2666 shifts out the previously transmitted 32-bit instruction on SDO.
+// 2- Therefore, after the last real command of an initialization or frame sequence,
+//    an additional NOP command is transmitted to flush the SPI echo pipeline and
+//    verify the echo of the last command.
+// 3- This state does not clear or modify DAC output data.
+// *******************
+// ERROR AND RECOVERY POLICY:
+// *******************
+// 1- cfg_rb_err_o is HIGH by default after reset.
+// 2- After all init/config commands are echoed correctly, cfg_rb_err_o is pulled LOW.
+// 3- If an echo mismatch occurs during init/config, normal DAC driving is not enabled.
+// 4- If an echo mismatch occurs during runtime, frame driving is stopped and the controller
+//    returns to the initialization sequence.
+// 5- If OVRTMP is LOW, normal DAC driving is stopped and the controller waits/reconfigures.
+// 6- The controller is intended to keep retrying configuration until a healthy state is reached
+//    when CFG_RETRY_FOREVER_EN is set.
+// *******************
+// REUSE ISSUES
+// Reset Strategy       : Asynchronous, active low system level reset
+// Clock Domains        : clk_i
+// Asynchronous I/F     : rst_al_i
+// Instantiations       : spi_master
+// Synthesizable (y/n)  : Y
+// Other                : TGP and LDAC are not controlled by this module
+//---------------------------------------------------------------------------------
+
+module ltc2666_controller #(
+    parameter           CLOCK_FREQ              = 100_000_000,          // // Clock Frequency of module
+
+    // Configuration retry behavior
+    parameter           CFG_RETRY_FOREVER_EN    = 1'b1,                 // // '1'-retry configuration forever, '0'-limit by CFG_RETRY_MAX
+    parameter           CFG_RETRY_MAX           = 10,                   // // Maximum configuration retry count when CFG_RETRY_FOREVER_EN is disabled
+
+    // Runtime frame behavior
+    parameter           FRAME_SYNC_UPDATE_EN    = 1'b0,                 // // '0'-Write Code n Update n, '1'-Write selected codes then Update All
+    parameter           FRAME_OVERWRITE_EN      = 1'b1,                 // // '1'-latest pending frame wins, '0'-overrun error if pending is full
+
+    // Optional span-all initialization
+    parameter           SPAN_INIT_ALL_EN        = 1'b0,                 // // '1'-write CH0_SOFT_SPAN to all channels using Write Span All
+
+    // CH0 to CH7 SoftSpan Configuration
+    parameter [2:0]     CH0_SOFT_SPAN           = 3'b100,               // // CHx_SOFT_SPAN: default +/-2.5V
+    parameter [2:0]     CH1_SOFT_SPAN           = 3'b100,               // // CHx_SOFT_SPAN: default +/-2.5V
+    parameter [2:0]     CH2_SOFT_SPAN           = 3'b100,               // // CHx_SOFT_SPAN: default +/-2.5V
+    parameter [2:0]     CH3_SOFT_SPAN           = 3'b100,               // // CHx_SOFT_SPAN: default +/-2.5V
+    parameter [2:0]     CH4_SOFT_SPAN           = 3'b100,               // // CHx_SOFT_SPAN: default +/-2.5V
+    parameter [2:0]     CH5_SOFT_SPAN           = 3'b100,               // // CHx_SOFT_SPAN: default +/-2.5V
+    parameter [2:0]     CH6_SOFT_SPAN           = 3'b100,               // // CHx_SOFT_SPAN: default +/-2.5V
+    parameter [2:0]     CH7_SOFT_SPAN           = 3'b100,               // // CHx_SOFT_SPAN: default +/-2.5V
+
+    // CH0 to CH7 initialization code
+    parameter [15:0]    CH0_INIT_CODE           = 16'h8000,             // // Mid-scale code, approximately 0V in bipolar ranges
+    parameter [15:0]    CH1_INIT_CODE           = 16'h8000,             // // Mid-scale code, approximately 0V in bipolar ranges
+    parameter [15:0]    CH2_INIT_CODE           = 16'h8000,             // // Mid-scale code, approximately 0V in bipolar ranges
+    parameter [15:0]    CH3_INIT_CODE           = 16'h8000,             // // Mid-scale code, approximately 0V in bipolar ranges
+    parameter [15:0]    CH4_INIT_CODE           = 16'h8000,             // // Mid-scale code, approximately 0V in bipolar ranges
+    parameter [15:0]    CH5_INIT_CODE           = 16'h8000,             // // Mid-scale code, approximately 0V in bipolar ranges
+    parameter [15:0]    CH6_INIT_CODE           = 16'h8000,             // // Mid-scale code, approximately 0V in bipolar ranges
+    parameter [15:0]    CH7_INIT_CODE           = 16'h8000,             // // Mid-scale code, approximately 0V in bipolar ranges
+
+    // Optional init-time MUXOUT configuration
+    parameter           MUXOUT_INIT_EN          = 1'b0,                 // // '1'-configure MUXOUT during init sequence
+    parameter [4:0]     MUXOUT_INIT_SEL         = 5'b00000,             // // MUXOUT selection code, default Disabled/Hi-Z
+
+    // Optional init-time power-down configuration
+    parameter           CH_POWER_DOWN_INIT_EN   = 1'b0,                 // // '1'-power down channels selected by CH_POWER_DOWN_INIT_MASK after init update
+    parameter [7:0]     CH_POWER_DOWN_INIT_MASK = 8'h00,                // // Channel power-down mask
+    parameter           CHIP_POWER_DOWN_INIT_EN = 1'b0                  // // '1'-power down complete chip after init update
+)(
+    input                               clk_i,                          // // system clk
+    input                               rst_al_i,                       // // active-low asynchronous reset
+
+    // LTC2666 SPI interface
+    input                               sdo_i,                          // // dac_pin_name:SDO - master in, slave out
+    output                              cs_ld_o,                        // // dac_pin_name:CS/LD - chip select/load
+    output                              sck_o,                          // // dac_pin_name:SCK - spi clk
+    output                              sdi_o,                          // // dac_pin_name:SDI - master out, slave in
+
+    // LTC2666 control/status pins
+    output                              clr_al_o,                       // // dac_pin_name:CLR - active-low clear
+    input                               ovrtmp_al_i,                    // // dac_pin_name:OVRTMP - active-low overtemperature flag
+
+    // Frame-based channel update interface
+    input                               frame_vld_i,                    // // one-clock pulse to latch input channel frame
+    input  [7:0]                        ch_update_mask_i,               // // channel update mask, bit0:CH0 ... bit7:CH7
+    input  [15:0]                       ch0_code_i,                     // // CH0 DAC code
+    input  [15:0]                       ch1_code_i,                     // // CH1 DAC code
+    input  [15:0]                       ch2_code_i,                     // // CH2 DAC code
+    input  [15:0]                       ch3_code_i,                     // // CH3 DAC code
+    input  [15:0]                       ch4_code_i,                     // // CH4 DAC code
+    input  [15:0]                       ch5_code_i,                     // // CH5 DAC code
+    input  [15:0]                       ch6_code_i,                     // // CH6 DAC code
+    input  [15:0]                       ch7_code_i,                     // // CH7 DAC code
+
+    // Error and status flags
+    output                              init_done_o,                    // // configuration completed successfully
+    output                              cfg_rb_err_o,                   // // configuration echo/readback error, HIGH by default
+    output                              run_rb_err_o,                   // // runtime echo/readback error
+    output                              ovrtmp_err_o,                   // // overtemperature error
+    output                              frame_busy_o,                   // // controller is applying a frame
+    output                              frame_done_o,                   // // one-clock pulse after frame completed
+    output                              frame_overrun_err_o,            // // frame overrun error when FRAME_OVERWRITE_EN = 0
+    output                              fault_o,                        // // global fault/status flag
+    output [2:0]                        active_ch_o,                    // // active channel index for debug/status
+    output [31:0]                       last_echo_data_o                // // last received 32-bit echo data
+);
+    // ####################################################################################
+    //                                     CONSTANTS
+    // ####################################################################################
+    localparam SPI_WIDTH = 32; // // LTC2666 echo readback uses 32-bit instruction cycles
+
+    localparam CLOCK_PERIOD = (10 ** 9) / CLOCK_FREQ; // // FPGA module period ns
+    localparam CLR_PULSE_TIMER = ((1_000 / CLOCK_PERIOD) > 0) ? (1_000 / CLOCK_PERIOD) : 1; // // 1us -> 1_000ns
+    localparam WAKEUP_TIMER = ((1_000_000 / CLOCK_PERIOD) > 0) ? (1_000_000 / CLOCK_PERIOD) : 1; // // 1ms -> 1_000_000ns
+    localparam CH_PWRUP_WAIT_TIMER = ((30_000 / CLOCK_PERIOD) > 0) ? (30_000 / CLOCK_PERIOD) : 1; // // 30us channel power-up wait
+    localparam CHIP_PWRUP_WAIT_TIMER = ((35_000 / CLOCK_PERIOD) > 0) ? (35_000 / CLOCK_PERIOD) : 1; // // 35us chip power-up wait
+
+    localparam SCLK_ACTIVE_TIME_CC = ((500 / CLOCK_PERIOD) > 3) ? (500 / CLOCK_PERIOD) : 4; // // 1MHz SPI target, SCLK half period
+    localparam CS_SETUP_TIME_CC = ((500 / CLOCK_PERIOD) > SCLK_ACTIVE_TIME_CC) ? (500 / CLOCK_PERIOD) : SCLK_ACTIVE_TIME_CC;
+    localparam CS_HOLD_TIME_CC  = ((500 / CLOCK_PERIOD) > SCLK_ACTIVE_TIME_CC) ? (500 / CLOCK_PERIOD) : SCLK_ACTIVE_TIME_CC;
+    localparam CS_INACTIVE_TIME_CC = ((500 / CLOCK_PERIOD) > 2) ? (500 / CLOCK_PERIOD) : 3;
+
+    // ####################################################################################
+    //                                LTC2666 COMMAND MAP
+    // ####################################################################################
+    localparam [3:0] CMD_WRITE_CODE_N            = 4'b0000;
+    localparam [3:0] CMD_WRITE_CODE_ALL          = 4'b1000;
+    localparam [3:0] CMD_WRITE_SPAN_N            = 4'b0110;
+    localparam [3:0] CMD_WRITE_SPAN_ALL          = 4'b1110;
+    localparam [3:0] CMD_UPDATE_N                = 4'b0001;
+    localparam [3:0] CMD_UPDATE_ALL              = 4'b1001;
+    localparam [3:0] CMD_WRITE_CODE_N_UPDATE_N   = 4'b0011;
+    localparam [3:0] CMD_WRITE_CODE_N_UPDATE_ALL = 4'b0010;
+    localparam [3:0] CMD_WRITE_ALL_UPDATE_ALL    = 4'b1010;
+    localparam [3:0] CMD_POWER_DOWN_N            = 4'b0100;
+    localparam [3:0] CMD_POWER_DOWN_CHIP         = 4'b0101;
+    localparam [3:0] CMD_ANALOG_MUX              = 4'b1011;
+    localparam [3:0] CMD_CONFIG                  = 4'b0111;
+    localparam [3:0] CMD_NOP                     = 4'b1111;
+
+    localparam [15:0] CONFIG_DATA = 16'h0000; // // TS=0: thermal shutdown enabled, RD=0: internal reference enabled
+
+    localparam [4:0] MUXOUT_DISABLED = 5'b00000; // // MUXOUT disabled / Hi-Z
+
+    // ####################################################################################
+    //                                    SIGNALS
+    // ####################################################################################
+    // // u_ltc2666_spi_intf
+    reg                         spi_en_r;
+    reg  [SPI_WIDTH-1:0]        spi_tx_data_r;
+    wire [SPI_WIDTH-1:0]        spi_rx_data_w;
+    wire                        spi_data_valid_w;
+    wire                        spi_busy_w;
+
+    // // spi echo tracking
+    reg                         spi_wait_r;
+    reg  [SPI_WIDTH-1:0]        spi_current_tx_data_r;
+    reg  [SPI_WIDTH-1:0]        spi_last_tx_data_r;
+    reg                         spi_last_tx_valid_r;
+    wire                        spi_echo_err_w;
+    wire                        frame_capture_ok_w;
+    wire                        frame_overrun_event_w;
+
+    // // main process counters
+    reg [31:0]                  timer_cntr_r;
+    reg [31:0]                  pwrup_wait_limit_r;
+    reg [7:0]                   cfg_retry_cntr_r;
+    reg [2:0]                   ch_cntr_r;
+
+    // // LTC2666 control pins
+    reg                         clr_al_r;
+
+    // // frame buffers
+    reg                         active_frame_vld_r;
+    reg [7:0]                   active_update_mask_r;
+    reg [15:0]                  active_ch0_code_r;
+    reg [15:0]                  active_ch1_code_r;
+    reg [15:0]                  active_ch2_code_r;
+    reg [15:0]                  active_ch3_code_r;
+    reg [15:0]                  active_ch4_code_r;
+    reg [15:0]                  active_ch5_code_r;
+    reg [15:0]                  active_ch6_code_r;
+    reg [15:0]                  active_ch7_code_r;
+
+    reg                         pending_frame_vld_r;
+    reg [7:0]                   pending_update_mask_r;
+    reg [15:0]                  pending_ch0_code_r;
+    reg [15:0]                  pending_ch1_code_r;
+    reg [15:0]                  pending_ch2_code_r;
+    reg [15:0]                  pending_ch3_code_r;
+    reg [15:0]                  pending_ch4_code_r;
+    reg [15:0]                  pending_ch5_code_r;
+    reg [15:0]                  pending_ch6_code_r;
+    reg [15:0]                  pending_ch7_code_r;
+
+    // // status flags
+    reg                         init_done_r;
+    reg                         cfg_rb_err_r;
+    reg                         run_rb_err_r;
+    reg                         ovrtmp_err_r;
+    reg                         frame_done_r;
+    reg                         frame_overrun_err_r;
+    reg [2:0]                   active_ch_r;
+    reg [31:0]                  last_echo_data_r;
+    reg [7:0]                   ch_power_down_stat_r;
+    reg                         chip_power_down_stat_r;
+    reg                         init_pwrdown_chip_phase_r;
+
+    // ####################################################################################
+    //                                  SPI MASTER INSTANCE
+    // ####################################################################################
+    spi_master #(
+        .SCLK_ACTIVE_TIME_CC (SCLK_ACTIVE_TIME_CC), // // SCLK active time clock counter
+        .CS_SETUP_TIME_CC    (CS_SETUP_TIME_CC),    // // Output delay SPI_CS valid before first clock edge
+        .CS_HOLD_TIME_CC     (CS_HOLD_TIME_CC),     // // Output delay SPI_CS valid after last clock edge
+        .CS_INACTIVE_TIME_CC (CS_INACTIVE_TIME_CC), // // CS high time
+        .SPI_MODE            (0),                   // // SPI mode 0
+        .SPI_WIDTH           (SPI_WIDTH)            // // Number of bits to serialize
+    ) u_ltc2666_spi_intf (
+        .clk_i        (clk_i),                      // // system clk
+        .rst_al_i     (rst_al_i),                   // // active-low asynchronous reset
+        .spi_enable_i (spi_en_r),                   // // initiate transaction
+        .miso_i       (sdo_i),                      // // master in, slave out
+        .tx_data_i    (spi_tx_data_r),              // // data to transmit
+        .rx_data_o    (spi_rx_data_w),              // // received data from slave
+        .cs_o         (cs_ld_o),                    // // chip select
+        .sclk_o       (sck_o),                      // // spi clk
+        .mosi_o       (sdi_o),                      // // master out, slave in
+        .data_valid_o (spi_data_valid_w),           // // 1 Pulse - operation finished according to SPI_WIDTH
+        .busy_o       (spi_busy_w)                  // // indicates transaction in progress
+    );
+
+    // ####################################################################################
+    //                                    FUNCTIONS
+    // ####################################################################################
+    function [31:0] ltc2666_word;
+        input [3:0]  command_i;
+        input [3:0]  address_i;
+        input [15:0] data_i;
+        begin
+            ltc2666_word = {8'h00, command_i, address_i, data_i};
+        end
+    endfunction
+
+    function [2:0] get_init_span;
+        input [2:0] ch_idx_i;
+        begin
+            case (ch_idx_i)
+                3'd0:    get_init_span = CH0_SOFT_SPAN;
+                3'd1:    get_init_span = CH1_SOFT_SPAN;
+                3'd2:    get_init_span = CH2_SOFT_SPAN;
+                3'd3:    get_init_span = CH3_SOFT_SPAN;
+                3'd4:    get_init_span = CH4_SOFT_SPAN;
+                3'd5:    get_init_span = CH5_SOFT_SPAN;
+                3'd6:    get_init_span = CH6_SOFT_SPAN;
+                3'd7:    get_init_span = CH7_SOFT_SPAN;
+                default: get_init_span = CH0_SOFT_SPAN;
+            endcase
+        end
+    endfunction
+
+    function [15:0] get_init_code;
+        input [2:0] ch_idx_i;
+        begin
+            case (ch_idx_i)
+                3'd0:    get_init_code = CH0_INIT_CODE;
+                3'd1:    get_init_code = CH1_INIT_CODE;
+                3'd2:    get_init_code = CH2_INIT_CODE;
+                3'd3:    get_init_code = CH3_INIT_CODE;
+                3'd4:    get_init_code = CH4_INIT_CODE;
+                3'd5:    get_init_code = CH5_INIT_CODE;
+                3'd6:    get_init_code = CH6_INIT_CODE;
+                3'd7:    get_init_code = CH7_INIT_CODE;
+                default: get_init_code = CH0_INIT_CODE;
+            endcase
+        end
+    endfunction
+
+    function [15:0] get_active_frame_code;
+        input [2:0] ch_idx_i;
+        begin
+            case (ch_idx_i)
+                3'd0:    get_active_frame_code = active_ch0_code_r;
+                3'd1:    get_active_frame_code = active_ch1_code_r;
+                3'd2:    get_active_frame_code = active_ch2_code_r;
+                3'd3:    get_active_frame_code = active_ch3_code_r;
+                3'd4:    get_active_frame_code = active_ch4_code_r;
+                3'd5:    get_active_frame_code = active_ch5_code_r;
+                3'd6:    get_active_frame_code = active_ch6_code_r;
+                3'd7:    get_active_frame_code = active_ch7_code_r;
+                default: get_active_frame_code = active_ch0_code_r;
+            endcase
+        end
+    endfunction
+
+    function frame_has_powered_down_channel;
+        input [7:0] frame_mask_i;
+        input [7:0] power_down_mask_i;
+        begin
+            frame_has_powered_down_channel = |(frame_mask_i & power_down_mask_i);
+        end
+    endfunction
+
+    assign spi_echo_err_w = spi_data_valid_w && spi_last_tx_valid_r && (spi_rx_data_w != spi_last_tx_data_r);
+    assign frame_overrun_event_w = frame_vld_i && init_done_r && pending_frame_vld_r && (FRAME_OVERWRITE_EN == 1'b0);
+    assign frame_capture_ok_w = frame_vld_i && init_done_r && (!pending_frame_vld_r || (FRAME_OVERWRITE_EN == 1'b1));
+
+    //#############################################################################
+    //                               STATE MACHINE
+    //#############################################################################
+    localparam STATE_WIDTH = 17;
+    localparam [STATE_WIDTH-1:0] S_CLR              = 17'd1,     //!1-Clear DAC
+                                   S_WAKEUP           = 17'd2,     //!2-Wait after clear
+                                   S_INIT_NOP         = 17'd4,     //!3-Initialize echo pipeline
+                                   S_INIT_CONFIG      = 17'd8,     //!4-Configure internal reference and thermal shutdown
+                                   S_INIT_MUX         = 17'd16,    //!5-Configure MUXOUT if enabled
+                                   S_INIT_SPAN        = 17'd32,    //!6-Configure channel SoftSpan values
+                                   S_INIT_CODE        = 17'd64,    //!7-Write channel init codes
+                                   S_INIT_UPDATE_ALL  = 17'd128,   //!8-Update all DAC outputs after init code/span writes
+                                   S_INIT_POWER_DOWN  = 17'd256,   //!9-Apply optional init-time power-down commands
+                                   S_INIT_ECHO_FLUSH  = 17'd512,   //!10-Flush echo pipeline after last init command
+                                   S_IDLE             = 17'd1024,  //!11-Wait for a valid frame
+                                   S_FRAME_CAPTURE    = 17'd2048,  //!12-Capture pending frame into active frame
+                                   S_FRAME_WRITE_CODE = 17'd4096,  //!13-Write selected channel codes
+                                   S_FRAME_UPDATE     = 17'd8192,  //!14-Update All in synchronized frame mode
+                                   S_FRAME_PWRUP_WAIT = 17'd16384, //!15-Wait after waking up a powered-down channel/chip
+                                   S_FRAME_ECHO_FLUSH = 17'd32768, //!16-Flush echo pipeline after last frame command
+                                   S_RECONFIG        = 17'd65536; //!17-Reconfiguration control and optional retry limiting
+
+    reg [STATE_WIDTH-1:0] state /* synthesis syn_encoding = "safe,onehot" */;
+
+    //#############################################################################
+    //                               MAIN PROCESS
+    //#############################################################################
+    always @(posedge clk_i or negedge rst_al_i) begin
+        if (!rst_al_i) begin
+            state                   <= S_CLR;
+            ////spi
+            spi_en_r                <= 1'b0;
+            spi_tx_data_r           <= 0;
+            spi_wait_r              <= 1'b0;
+            spi_current_tx_data_r   <= 0;
+            spi_last_tx_data_r      <= 0;
+            spi_last_tx_valid_r     <= 1'b0;
+            ////counters
+            timer_cntr_r            <= 0;
+            pwrup_wait_limit_r      <= 0;
+            cfg_retry_cntr_r        <= 0;
+            ch_cntr_r               <= 0;
+            ////i/o
+            clr_al_r                <= 1'b1;
+            ////frame buffers
+            active_frame_vld_r      <= 1'b0;
+            active_update_mask_r    <= 0;
+            active_ch0_code_r       <= 0;
+            active_ch1_code_r       <= 0;
+            active_ch2_code_r       <= 0;
+            active_ch3_code_r       <= 0;
+            active_ch4_code_r       <= 0;
+            active_ch5_code_r       <= 0;
+            active_ch6_code_r       <= 0;
+            active_ch7_code_r       <= 0;
+            pending_frame_vld_r     <= 1'b0;
+            pending_update_mask_r   <= 0;
+            pending_ch0_code_r      <= 0;
+            pending_ch1_code_r      <= 0;
+            pending_ch2_code_r      <= 0;
+            pending_ch3_code_r      <= 0;
+            pending_ch4_code_r      <= 0;
+            pending_ch5_code_r      <= 0;
+            pending_ch6_code_r      <= 0;
+            pending_ch7_code_r      <= 0;
+            ////error&status flags
+            init_done_r             <= 1'b0;
+            cfg_rb_err_r            <= 1'b1;
+            run_rb_err_r            <= 1'b0;
+            ovrtmp_err_r            <= 1'b0;
+            frame_done_r            <= 1'b0;
+            frame_overrun_err_r     <= 1'b0;
+            active_ch_r             <= 0;
+            last_echo_data_r        <= 0;
+            ch_power_down_stat_r    <= 0;
+            chip_power_down_stat_r  <= 1'b0;
+            init_pwrdown_chip_phase_r <= 1'b0;
+        end else begin
+            spi_en_r     <= 1'b0;
+            frame_done_r <= 1'b0;
+
+            if (spi_data_valid_w) begin
+                last_echo_data_r    <= spi_rx_data_w;
+                spi_last_tx_data_r  <= spi_current_tx_data_r;
+                spi_last_tx_valid_r <= 1'b1;
+            end
+
+            // Capture incoming frames while the controller is healthy. The CPU is not required
+            // to check a ready signal; therefore, the latest pending frame can be retained.
+            if (frame_capture_ok_w) begin
+                pending_frame_vld_r   <= 1'b1;
+                pending_update_mask_r <= ch_update_mask_i;
+                pending_ch0_code_r    <= ch0_code_i;
+                pending_ch1_code_r    <= ch1_code_i;
+                pending_ch2_code_r    <= ch2_code_i;
+                pending_ch3_code_r    <= ch3_code_i;
+                pending_ch4_code_r    <= ch4_code_i;
+                pending_ch5_code_r    <= ch5_code_i;
+                pending_ch6_code_r    <= ch6_code_i;
+                pending_ch7_code_r    <= ch7_code_i;
+            end
+
+            if (frame_overrun_event_w) begin
+                frame_overrun_err_r <= 1'b1;
+                init_done_r         <= 1'b0;
+                state               <= S_RECONFIG;
+                spi_wait_r          <= 1'b0;
+                spi_last_tx_valid_r <= 1'b0;
+            end else if (!ovrtmp_al_i && init_done_r) begin
+                ovrtmp_err_r       <= 1'b1;
+                init_done_r        <= 1'b0;
+                state              <= S_RECONFIG;
+                spi_wait_r         <= 1'b0;
+                spi_last_tx_valid_r<= 1'b0;
+            end else begin
+                case (state)
+                    S_CLR: begin
+                        // CLR is driven LOW to force the DAC into its hardware clear/reset condition.
+                        // The SPI echo pipeline is invalid after this point and must be restarted.
+                        init_done_r           <= 1'b0;
+                        clr_al_r              <= 1'b0;
+                        spi_wait_r            <= 1'b0;
+                        spi_last_tx_valid_r   <= 1'b0;
+                        active_frame_vld_r    <= 1'b0;
+                        pending_frame_vld_r   <= 1'b0;
+                        ch_cntr_r             <= 0;
+                        if (timer_cntr_r == CLR_PULSE_TIMER - 1) begin
+                            timer_cntr_r <= 0;
+                            state        <= S_WAKEUP;
+                        end else begin
+                            timer_cntr_r <= timer_cntr_r + 1;
+                        end
+                    end
+
+                    S_WAKEUP: begin
+                        // Wait after releasing CLR before starting SPI initialization.
+                        clr_al_r <= 1'b1;
+                        if (timer_cntr_r == WAKEUP_TIMER - 1) begin
+                            timer_cntr_r <= 0;
+                            state        <= S_INIT_NOP;
+                        end else begin
+                            timer_cntr_r <= timer_cntr_r + 1;
+                        end
+                    end
+
+                    S_INIT_NOP: begin
+                        // First NOP initializes the echo pipeline. Its received echo is not checked.
+                        if (!spi_wait_r && !spi_busy_w) begin
+                            spi_tx_data_r         <= ltc2666_word(CMD_NOP, 4'h0, 16'h0000);
+                            spi_current_tx_data_r <= ltc2666_word(CMD_NOP, 4'h0, 16'h0000);
+                            spi_en_r              <= 1'b1;
+                            spi_wait_r            <= 1'b1;
+                        end else if (spi_data_valid_w) begin
+                            spi_wait_r <= 1'b0;
+                            state      <= S_INIT_CONFIG;
+                        end
+                    end
+
+                    S_INIT_CONFIG: begin
+                        // CONFIG_DATA keeps internal reference enabled and thermal shutdown protection enabled.
+                        if (!spi_wait_r && !spi_busy_w) begin
+                            spi_tx_data_r         <= ltc2666_word(CMD_CONFIG, 4'h0, CONFIG_DATA);
+                            spi_current_tx_data_r <= ltc2666_word(CMD_CONFIG, 4'h0, CONFIG_DATA);
+                            spi_en_r              <= 1'b1;
+                            spi_wait_r            <= 1'b1;
+                        end else if (spi_data_valid_w) begin
+                            spi_wait_r <= 1'b0;
+                            if (spi_echo_err_w) begin
+                                cfg_rb_err_r <= 1'b1;
+                                state        <= S_RECONFIG;
+                            end else begin
+                                state <= S_INIT_MUX;
+                            end
+                        end
+                    end
+
+                    S_INIT_MUX: begin
+                        // Optional init-time MUXOUT configuration. Default is disabled/Hi-Z.
+                        if (MUXOUT_INIT_EN == 1'b0) begin
+                            state <= S_INIT_SPAN;
+                        end else if (!spi_wait_r && !spi_busy_w) begin
+                            spi_tx_data_r         <= ltc2666_word(CMD_ANALOG_MUX, 4'h0, {11'b0, MUXOUT_INIT_SEL});
+                            spi_current_tx_data_r <= ltc2666_word(CMD_ANALOG_MUX, 4'h0, {11'b0, MUXOUT_INIT_SEL});
+                            spi_en_r              <= 1'b1;
+                            spi_wait_r            <= 1'b1;
+                        end else if (spi_data_valid_w) begin
+                            spi_wait_r <= 1'b0;
+                            if (spi_echo_err_w) begin
+                                cfg_rb_err_r <= 1'b1;
+                                state        <= S_RECONFIG;
+                            end else begin
+                                state <= S_INIT_SPAN;
+                            end
+                        end
+                    end
+
+                    S_INIT_SPAN: begin
+                        // Write SoftSpan configuration. By default, each channel is configured separately.
+                        if (SPAN_INIT_ALL_EN == 1'b1) begin
+                            if (!spi_wait_r && !spi_busy_w) begin
+                                spi_tx_data_r         <= ltc2666_word(CMD_WRITE_SPAN_ALL, 4'h0, {13'b0, CH0_SOFT_SPAN});
+                                spi_current_tx_data_r <= ltc2666_word(CMD_WRITE_SPAN_ALL, 4'h0, {13'b0, CH0_SOFT_SPAN});
+                                spi_en_r              <= 1'b1;
+                                spi_wait_r            <= 1'b1;
+                            end else if (spi_data_valid_w) begin
+                                spi_wait_r <= 1'b0;
+                                if (spi_echo_err_w) begin
+                                    cfg_rb_err_r <= 1'b1;
+                                    state        <= S_RECONFIG;
+                                end else begin
+                                    ch_cntr_r <= 0;
+                                    state     <= S_INIT_CODE;
+                                end
+                            end
+                        end else begin
+                            if (!spi_wait_r && !spi_busy_w) begin
+                                spi_tx_data_r         <= ltc2666_word(CMD_WRITE_SPAN_N, {1'b0, ch_cntr_r}, {13'b0, get_init_span(ch_cntr_r)});
+                                spi_current_tx_data_r <= ltc2666_word(CMD_WRITE_SPAN_N, {1'b0, ch_cntr_r}, {13'b0, get_init_span(ch_cntr_r)});
+                                spi_en_r              <= 1'b1;
+                                spi_wait_r            <= 1'b1;
+                            end else if (spi_data_valid_w) begin
+                                spi_wait_r <= 1'b0;
+                                if (spi_echo_err_w) begin
+                                    cfg_rb_err_r <= 1'b1;
+                                    state        <= S_RECONFIG;
+                                end else if (ch_cntr_r == 3'd7) begin
+                                    ch_cntr_r <= 0;
+                                    state     <= S_INIT_CODE;
+                                end else begin
+                                    ch_cntr_r <= ch_cntr_r + 1;
+                                end
+                            end
+                        end
+                    end
+
+                    S_INIT_CODE: begin
+                        // Write default channel input codes. Update All is issued later to update outputs together.
+                        if (!spi_wait_r && !spi_busy_w) begin
+                            spi_tx_data_r         <= ltc2666_word(CMD_WRITE_CODE_N, {1'b0, ch_cntr_r}, get_init_code(ch_cntr_r));
+                            spi_current_tx_data_r <= ltc2666_word(CMD_WRITE_CODE_N, {1'b0, ch_cntr_r}, get_init_code(ch_cntr_r));
+                            spi_en_r              <= 1'b1;
+                            spi_wait_r            <= 1'b1;
+                        end else if (spi_data_valid_w) begin
+                            spi_wait_r <= 1'b0;
+                            if (spi_echo_err_w) begin
+                                cfg_rb_err_r <= 1'b1;
+                                state        <= S_RECONFIG;
+                            end else if (ch_cntr_r == 3'd7) begin
+                                ch_cntr_r <= 0;
+                                state     <= S_INIT_UPDATE_ALL;
+                            end else begin
+                                ch_cntr_r <= ch_cntr_r + 1;
+                            end
+                        end
+                    end
+
+                    S_INIT_UPDATE_ALL: begin
+                        // Update all DAC registers after all span/code input registers are prepared.
+                        if (!spi_wait_r && !spi_busy_w) begin
+                            spi_tx_data_r         <= ltc2666_word(CMD_UPDATE_ALL, 4'h0, 16'h0000);
+                            spi_current_tx_data_r <= ltc2666_word(CMD_UPDATE_ALL, 4'h0, 16'h0000);
+                            spi_en_r              <= 1'b1;
+                            spi_wait_r            <= 1'b1;
+                        end else if (spi_data_valid_w) begin
+                            spi_wait_r <= 1'b0;
+                            if (spi_echo_err_w) begin
+                                cfg_rb_err_r <= 1'b1;
+                                state        <= S_RECONFIG;
+                            end else begin
+                                ch_cntr_r <= 0;
+                                init_pwrdown_chip_phase_r <= 1'b0;
+                                state     <= S_INIT_POWER_DOWN;
+                            end
+                        end
+                    end
+
+                    S_INIT_POWER_DOWN: begin
+                        // Optional power-down commands are applied after Update All so unused channels remain powered down.
+                        if (!init_pwrdown_chip_phase_r && CH_POWER_DOWN_INIT_EN == 1'b1 && CH_POWER_DOWN_INIT_MASK[ch_cntr_r]) begin
+                            if (!spi_wait_r && !spi_busy_w) begin
+                                spi_tx_data_r         <= ltc2666_word(CMD_POWER_DOWN_N, {1'b0, ch_cntr_r}, 16'h0000);
+                                spi_current_tx_data_r <= ltc2666_word(CMD_POWER_DOWN_N, {1'b0, ch_cntr_r}, 16'h0000);
+                                spi_en_r              <= 1'b1;
+                                spi_wait_r            <= 1'b1;
+                            end else if (spi_data_valid_w) begin
+                                spi_wait_r <= 1'b0;
+                                if (spi_echo_err_w) begin
+                                    cfg_rb_err_r <= 1'b1;
+                                    state        <= S_RECONFIG;
+                                end else begin
+                                    ch_power_down_stat_r[ch_cntr_r] <= 1'b1;
+                                    if (ch_cntr_r == 3'd7) begin
+                                        init_pwrdown_chip_phase_r <= 1'b1;
+                                        ch_cntr_r                 <= 0;
+                                    end else begin
+                                        ch_cntr_r <= ch_cntr_r + 1;
+                                    end
+                                end
+                            end
+                        end else if (!init_pwrdown_chip_phase_r && CH_POWER_DOWN_INIT_EN == 1'b1 && ch_cntr_r != 3'd7) begin
+                            ch_cntr_r <= ch_cntr_r + 1;
+                        end else if (!init_pwrdown_chip_phase_r) begin
+                            init_pwrdown_chip_phase_r <= 1'b1;
+                            ch_cntr_r                 <= 0;
+                        end else if (CHIP_POWER_DOWN_INIT_EN == 1'b1) begin
+                            if (!spi_wait_r && !spi_busy_w) begin
+                                spi_tx_data_r         <= ltc2666_word(CMD_POWER_DOWN_CHIP, 4'h0, 16'h0000);
+                                spi_current_tx_data_r <= ltc2666_word(CMD_POWER_DOWN_CHIP, 4'h0, 16'h0000);
+                                spi_en_r              <= 1'b1;
+                                spi_wait_r            <= 1'b1;
+                            end else if (spi_data_valid_w) begin
+                                spi_wait_r <= 1'b0;
+                                if (spi_echo_err_w) begin
+                                    cfg_rb_err_r <= 1'b1;
+                                    state        <= S_RECONFIG;
+                                end else begin
+                                    chip_power_down_stat_r     <= 1'b1;
+                                    init_pwrdown_chip_phase_r  <= 1'b0;
+                                    state                      <= S_INIT_ECHO_FLUSH;
+                                end
+                            end
+                        end else begin
+                            init_pwrdown_chip_phase_r <= 1'b0;
+                            state                     <= S_INIT_ECHO_FLUSH;
+                        end
+                    end
+
+                    S_INIT_ECHO_FLUSH: begin
+                        // Extra NOP shifts out and verifies the echo of the last real init command.
+                        if (!spi_wait_r && !spi_busy_w) begin
+                            spi_tx_data_r         <= ltc2666_word(CMD_NOP, 4'h0, 16'h0000);
+                            spi_current_tx_data_r <= ltc2666_word(CMD_NOP, 4'h0, 16'h0000);
+                            spi_en_r              <= 1'b1;
+                            spi_wait_r            <= 1'b1;
+                        end else if (spi_data_valid_w) begin
+                            spi_wait_r <= 1'b0;
+                            if (spi_echo_err_w || !ovrtmp_al_i) begin
+                                cfg_rb_err_r <= 1'b1;
+                                ovrtmp_err_r <= !ovrtmp_al_i;
+                                state        <= S_RECONFIG;
+                            end else begin
+                                cfg_rb_err_r          <= 1'b0;
+                                run_rb_err_r          <= 1'b0;
+                                ovrtmp_err_r          <= 1'b0;
+                                frame_overrun_err_r   <= 1'b0;
+                                init_done_r           <= 1'b1;
+                                cfg_retry_cntr_r      <= 0;
+                                state                 <= S_IDLE;
+                            end
+                        end
+                    end
+
+                    S_IDLE: begin
+                        if (!ovrtmp_al_i) begin
+                            ovrtmp_err_r <= 1'b1;
+                            init_done_r  <= 1'b0;
+                            state        <= S_RECONFIG;
+                        end else if (pending_frame_vld_r) begin
+                            state <= S_FRAME_CAPTURE;
+                        end
+                    end
+
+                    S_FRAME_CAPTURE: begin
+                        // Move pending frame into active buffer. The pending frame is consumed here.
+                        active_frame_vld_r    <= 1'b1;
+                        active_update_mask_r  <= pending_update_mask_r;
+                        active_ch0_code_r     <= pending_ch0_code_r;
+                        active_ch1_code_r     <= pending_ch1_code_r;
+                        active_ch2_code_r     <= pending_ch2_code_r;
+                        active_ch3_code_r     <= pending_ch3_code_r;
+                        active_ch4_code_r     <= pending_ch4_code_r;
+                        active_ch5_code_r     <= pending_ch5_code_r;
+                        active_ch6_code_r     <= pending_ch6_code_r;
+                        active_ch7_code_r     <= pending_ch7_code_r;
+                        pending_frame_vld_r   <= 1'b0;
+                        ch_cntr_r             <= 0;
+                        if (pending_update_mask_r == 8'h00) begin
+                            active_frame_vld_r <= 1'b0;
+                            frame_done_r       <= 1'b1;
+                            state              <= S_IDLE;
+                        end else begin
+                            state <= S_FRAME_WRITE_CODE;
+                        end
+                    end
+
+                    S_FRAME_WRITE_CODE: begin
+                        active_ch_r <= ch_cntr_r;
+                        if (!active_update_mask_r[ch_cntr_r]) begin
+                            if (ch_cntr_r == 3'd7) begin
+                                if (FRAME_SYNC_UPDATE_EN == 1'b1) begin
+                                    state <= S_FRAME_UPDATE;
+                                end else begin
+                                    state <= S_FRAME_ECHO_FLUSH;
+                                end
+                            end else begin
+                                ch_cntr_r <= ch_cntr_r + 1;
+                            end
+                        end else if (!spi_wait_r && !spi_busy_w) begin
+                            if (FRAME_SYNC_UPDATE_EN == 1'b1) begin
+                                spi_tx_data_r         <= ltc2666_word(CMD_WRITE_CODE_N, {1'b0, ch_cntr_r}, get_active_frame_code(ch_cntr_r));
+                                spi_current_tx_data_r <= ltc2666_word(CMD_WRITE_CODE_N, {1'b0, ch_cntr_r}, get_active_frame_code(ch_cntr_r));
+                            end else begin
+                                spi_tx_data_r         <= ltc2666_word(CMD_WRITE_CODE_N_UPDATE_N, {1'b0, ch_cntr_r}, get_active_frame_code(ch_cntr_r));
+                                spi_current_tx_data_r <= ltc2666_word(CMD_WRITE_CODE_N_UPDATE_N, {1'b0, ch_cntr_r}, get_active_frame_code(ch_cntr_r));
+                            end
+                            spi_en_r   <= 1'b1;
+                            spi_wait_r <= 1'b1;
+                        end else if (spi_data_valid_w) begin
+                            spi_wait_r <= 1'b0;
+                            if (spi_echo_err_w || !ovrtmp_al_i) begin
+                                run_rb_err_r <= spi_echo_err_w;
+                                ovrtmp_err_r <= !ovrtmp_al_i;
+                                init_done_r  <= 1'b0;
+                                state        <= S_RECONFIG;
+                            end else if (FRAME_SYNC_UPDATE_EN == 1'b0 && (chip_power_down_stat_r || ch_power_down_stat_r[ch_cntr_r])) begin
+                                pwrup_wait_limit_r            <= chip_power_down_stat_r ? CHIP_PWRUP_WAIT_TIMER : CH_PWRUP_WAIT_TIMER;
+                                chip_power_down_stat_r        <= 1'b0;
+                                ch_power_down_stat_r[ch_cntr_r] <= 1'b0;
+                                state                         <= S_FRAME_PWRUP_WAIT;
+                            end else if (ch_cntr_r == 3'd7) begin
+                                if (FRAME_SYNC_UPDATE_EN == 1'b1) begin
+                                    state <= S_FRAME_UPDATE;
+                                end else begin
+                                    state <= S_FRAME_ECHO_FLUSH;
+                                end
+                            end else begin
+                                ch_cntr_r <= ch_cntr_r + 1;
+                            end
+                        end
+                    end
+
+                    S_FRAME_UPDATE: begin
+                        // Synchronized frame mode: all selected input registers are updated together.
+                        if (!spi_wait_r && !spi_busy_w) begin
+                            spi_tx_data_r         <= ltc2666_word(CMD_UPDATE_ALL, 4'h0, 16'h0000);
+                            spi_current_tx_data_r <= ltc2666_word(CMD_UPDATE_ALL, 4'h0, 16'h0000);
+                            spi_en_r              <= 1'b1;
+                            spi_wait_r            <= 1'b1;
+                        end else if (spi_data_valid_w) begin
+                            spi_wait_r <= 1'b0;
+                            if (spi_echo_err_w || !ovrtmp_al_i) begin
+                                run_rb_err_r <= spi_echo_err_w;
+                                ovrtmp_err_r <= !ovrtmp_al_i;
+                                init_done_r  <= 1'b0;
+                                state        <= S_RECONFIG;
+                            end else if (chip_power_down_stat_r || frame_has_powered_down_channel(active_update_mask_r, ch_power_down_stat_r)) begin
+                                pwrup_wait_limit_r     <= chip_power_down_stat_r ? CHIP_PWRUP_WAIT_TIMER : CH_PWRUP_WAIT_TIMER;
+                                chip_power_down_stat_r <= 1'b0;
+                                ch_power_down_stat_r   <= ch_power_down_stat_r & ~active_update_mask_r;
+                                state                  <= S_FRAME_PWRUP_WAIT;
+                            end else begin
+                                state <= S_FRAME_ECHO_FLUSH;
+                            end
+                        end
+                    end
+
+                    S_FRAME_PWRUP_WAIT: begin
+                        // Wait after an update command wakes a powered-down channel or the complete chip.
+                        if (timer_cntr_r == pwrup_wait_limit_r - 1) begin
+                            timer_cntr_r <= 0;
+                            if (FRAME_SYNC_UPDATE_EN == 1'b1) begin
+                                state <= S_FRAME_ECHO_FLUSH;
+                            end else if (ch_cntr_r == 3'd7) begin
+                                state <= S_FRAME_ECHO_FLUSH;
+                            end else begin
+                                ch_cntr_r <= ch_cntr_r + 1;
+                                state     <= S_FRAME_WRITE_CODE;
+                            end
+                        end else begin
+                            timer_cntr_r <= timer_cntr_r + 1;
+                        end
+                    end
+
+                    S_FRAME_ECHO_FLUSH: begin
+                        // Extra NOP shifts out and verifies the echo of the last real frame command.
+                        if (!spi_wait_r && !spi_busy_w) begin
+                            spi_tx_data_r         <= ltc2666_word(CMD_NOP, 4'h0, 16'h0000);
+                            spi_current_tx_data_r <= ltc2666_word(CMD_NOP, 4'h0, 16'h0000);
+                            spi_en_r              <= 1'b1;
+                            spi_wait_r            <= 1'b1;
+                        end else if (spi_data_valid_w) begin
+                            spi_wait_r <= 1'b0;
+                            if (spi_echo_err_w || !ovrtmp_al_i) begin
+                                run_rb_err_r <= spi_echo_err_w;
+                                ovrtmp_err_r <= !ovrtmp_al_i;
+                                init_done_r  <= 1'b0;
+                                state        <= S_RECONFIG;
+                            end else begin
+                                active_frame_vld_r <= 1'b0;
+                                frame_done_r       <= 1'b1;
+                                state              <= S_IDLE;
+                            end
+                        end
+                    end
+
+                    S_RECONFIG: begin
+                        // Stop normal operation and restart initialization if retry policy allows it.
+                        init_done_r           <= 1'b0;
+                        active_frame_vld_r    <= 1'b0;
+                        pending_frame_vld_r   <= 1'b0;
+                        spi_wait_r            <= 1'b0;
+                        spi_last_tx_valid_r   <= 1'b0;
+                        ch_cntr_r             <= 0;
+                        timer_cntr_r          <= 0;
+                        clr_al_r              <= 1'b1;
+                        if (!ovrtmp_al_i) begin
+                            ovrtmp_err_r <= 1'b1;
+                            state        <= S_RECONFIG;
+                        end else if (CFG_RETRY_FOREVER_EN == 1'b1) begin
+                            state <= S_CLR;
+                        end else if (cfg_retry_cntr_r < CFG_RETRY_MAX) begin
+                            cfg_retry_cntr_r <= cfg_retry_cntr_r + 1;
+                            state            <= S_CLR;
+                        end else begin
+                            state <= S_RECONFIG;
+                        end
+                    end
+
+                    default: begin
+                        state <= S_CLR;
+                    end
+                endcase
+            end
+        end
+    end
+
+    //#########################################################################
+    //                               WIRE ASSIGNMENT
+    //#########################################################################
+    assign clr_al_o              = clr_al_r;
+    assign init_done_o           = init_done_r;
+    assign cfg_rb_err_o          = cfg_rb_err_r;
+    assign run_rb_err_o          = run_rb_err_r;
+    assign ovrtmp_err_o          = ovrtmp_err_r;
+    assign frame_busy_o          = (state == S_FRAME_CAPTURE) || (state == S_FRAME_WRITE_CODE) || (state == S_FRAME_UPDATE) ||
+                                   (state == S_FRAME_PWRUP_WAIT) || (state == S_FRAME_ECHO_FLUSH);
+    assign frame_done_o          = frame_done_r;
+    assign frame_overrun_err_o   = frame_overrun_err_r;
+    assign fault_o               = cfg_rb_err_r || run_rb_err_r || ovrtmp_err_r || frame_overrun_err_r;
+    assign active_ch_o           = active_ch_r;
+    assign last_echo_data_o      = last_echo_data_r;
+
+endmodule
