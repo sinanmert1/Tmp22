@@ -1,0 +1,122 @@
+Evet, v4’e sadece 32 clock capture delay ekleyeceğiz. frame_update_req_w assign’ına dokunmuyoruz. O aynı kalacak:
+assign frame_update_req_w = frame_vld_i && init_done_r && frame_input_changed_w;
+Zaten v4’te update isteği bu sinyal üzerinden oluşuyor ve S_IDLE içinde snapshot alınıyor. � �
+ltc2666_controller_v4.v
+ltc2666_controller_v4.v
+1. Localparam ekle
+Constants kısmında uygun yere ekle:
+localparam FRAME_CAPTURE_DELAY_CC = 32; // // wait after first input change before capturing channel inputs
+Mesela şuradan sonra koyabilirsin:
+localparam CS_INACTIVE_TIME_CC = ((500 / CLOCK_PERIOD) > 2) ? (500 / CLOCK_PERIOD) : 3;
+
+localparam FRAME_CAPTURE_DELAY_CC = 32; // // wait after first input change before capturing channel inputs
+2. Register ekle
+Counter registerlarının olduğu yere ekle:
+reg [7:0] frame_capture_delay_cntr_r;
+Örneğin:
+reg [31:0]                  timer_cntr_r;
+reg [31:0]                  pwrup_wait_limit_r;
+reg [7:0]                   cfg_retry_cntr_r;
+reg [2:0]                   ch_cntr_r;
+reg [7:0]                   frame_capture_delay_cntr_r;
+32 saymak için 6 bit bile yeter ama [7:0] sade ve güvenli.
+3. Reset kısmına ekle
+Reset bloğunda counter resetlerinin yanına ekle:
+frame_capture_delay_cntr_r <= 0;
+Örneğin:
+timer_cntr_r               <= 0;
+pwrup_wait_limit_r         <= 0;
+cfg_retry_cntr_r           <= 0;
+ch_cntr_r                  <= 0;
+frame_capture_delay_cntr_r <= 0;
+4. Global fault/overtemp branch içinde sıfırla
+V4’te şu yapı vardı:
+if (!ovrtmp_al_i && init_done_r) begin
+    ovrtmp_err_r        <= 1'b1;
+    init_done_r         <= 1'b0;
+    state               <= S_RECONFIG;
+    spi_wait_r          <= 1'b0;
+    spi_last_tx_valid_r <= 1'b0;
+end else begin
+Buna şunu ekle:
+frame_capture_delay_cntr_r <= 0;
+Son hali:
+if (!ovrtmp_al_i && init_done_r) begin
+    ovrtmp_err_r                <= 1'b1;
+    init_done_r                 <= 1'b0;
+    state                       <= S_RECONFIG;
+    spi_wait_r                  <= 1'b0;
+    spi_last_tx_valid_r         <= 1'b0;
+    frame_capture_delay_cntr_r  <= 0;
+end else begin
+5. S_CLR içinde sıfırla
+S_CLR içinde de temizlemek iyi olur:
+frame_capture_delay_cntr_r <= 0;
+Örneğin:
+S_CLR: begin
+    init_done_r                 <= 1'b0;
+    clr_al_r                    <= 1'b0;
+    spi_wait_r                  <= 1'b0;
+    spi_last_tx_valid_r         <= 1'b0;
+    active_frame_vld_r          <= 1'b0;
+    ch_cntr_r                   <= 0;
+    frame_capture_delay_cntr_r  <= 0;
+6. S_IDLE state’ini değiştir
+Mevcut S_IDLE şu mantıkta:
+S_IDLE: begin
+    if (!ovrtmp_al_i) begin
+        ovrtmp_err_r <= 1'b1;
+        init_done_r  <= 1'b0;
+        state        <= S_RECONFIG;
+    end else if (frame_update_req_w) begin
+        active_frame_vld_r   <= 1'b1;
+        active_update_mask_r <= ch_update_mask_i;
+        active_ch0_code_r    <= ch0_code_i;
+        ...
+        state                <= S_FRAME_CAPTURE;
+    end
+end
+Bunu komple aşağıdakiyle değiştir:
+S_IDLE: begin
+    if (!ovrtmp_al_i) begin
+        ovrtmp_err_r                <= 1'b1;
+        init_done_r                 <= 1'b0;
+        frame_capture_delay_cntr_r  <= 0;
+        state                       <= S_RECONFIG;
+    end else if (frame_update_req_w) begin
+        if (frame_capture_delay_cntr_r == FRAME_CAPTURE_DELAY_CC - 1) begin
+            frame_capture_delay_cntr_r <= 0;
+
+            // Capture the latest input values after a short settle window.
+            active_frame_vld_r   <= 1'b1;
+            active_update_mask_r <= ch_update_mask_i;
+            active_ch0_code_r    <= ch0_code_i;
+            active_ch1_code_r    <= ch1_code_i;
+            active_ch2_code_r    <= ch2_code_i;
+            active_ch3_code_r    <= ch3_code_i;
+            active_ch4_code_r    <= ch4_code_i;
+            active_ch5_code_r    <= ch5_code_i;
+            active_ch6_code_r    <= ch6_code_i;
+            active_ch7_code_r    <= ch7_code_i;
+            ch_cntr_r            <= 0;
+            state                <= S_FRAME_CAPTURE;
+        end else begin
+            frame_capture_delay_cntr_r <= frame_capture_delay_cntr_r + 1;
+        end
+    end else begin
+        frame_capture_delay_cntr_r <= 0;
+    end
+end
+7. S_RECONFIG içinde de sıfırlamak iyi olur
+S_RECONFIG state’inin başına şunu ekleyebilirsin:
+frame_capture_delay_cntr_r <= 0;
+Özetle değişen mantık şu:
+Eski:
+Değişimi görür görmez snapshot al.
+
+Yeni:
+Değişimi gör.
+32 clock bekle.
+Son güncel ch0..ch7 portlarını snapshot al.
+DAC frame'i başlat.
+frame_update_req_w, frame_input_changed_w, last_chX_code_r ve frame sonundaki last_chX_code_r güncellemelerine dokunmuyoruz. Bu yüzden değişiklik küçük ve kontrollü kalıyor.
