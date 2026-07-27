@@ -1,0 +1,166 @@
+Evet, mantıksal olarak dokuzuncu değişken/kanal gibi düşünebiliriz, fakat ch_update_mask_i’yi 9 bite çıkarmayalım. MUXOUT komutu DAC kanal yazma komutundan farklı olduğu için ayrı bir state ile mevcut frame akışına eklemek en sade çözüm olur.
+Böylece:
+muxout_sel_i değişir
+→ mevcut 32-clock bekleme çalışır
+→ MUX seçimi ve 8 kanal birlikte snapshot alınır
+→ önce MUXOUT komutu gönderilir
+→ ardından mevcut kanal yazma akışı devam eder
+→ echo kontrolleri mevcut yöntemle yapılır
+Bu çözümde ayrıca muxout_valid_i gerekmez. MUX seçimi controller busy iken değişirse, kanal değerlerinde olduğu gibi bir sonraki IDLE geçişinde yakalanır.
+1. Runtime MUXOUT input’u ekle
+Port listesine:
+input [4:0] muxout_sel_i, // // runtime MUXOUT source selection
+Örnek değerler:
+5'b00000 // Disabled / Hi-Z
+5'b10000 // VOUT0
+5'b10001 // VOUT1
+...
+5'b10111 // VOUT7
+5'b11010 // Temperature Monitor
+MUXOUT_INIT_EN şimdilik parameter olarak kalabilir; fakat input açılışa yetişmediği için top seviyede:
+.MUXOUT_INIT_EN(1'b0)
+kullanırız. Böylece init sırasında MUXOUT komutu gönderilmez.
+2. Active ve last registerlarını ekle
+Frame buffer tarafına:
+reg [4:0] active_muxout_sel_r;
+Son başarılı değerler tarafına:
+reg [4:0] last_muxout_sel_r;
+Reset bölümüne:
+active_muxout_sel_r <= 5'b00000;
+last_muxout_sel_r   <= 5'b00000;
+3. MUXOUT değişimini mevcut change-detect’e ekle
+Mevcut frame_input_changed_w sonuna MUXOUT karşılaştırmasını ekle:
+assign frame_input_changed_w =
+       (ch_update_mask_i != last_update_mask_r) ||
+       (ch_update_mask_i[0] && (ch0_code_i != last_ch0_code_r)) ||
+       (ch_update_mask_i[1] && (ch1_code_i != last_ch1_code_r)) ||
+       (ch_update_mask_i[2] && (ch2_code_i != last_ch2_code_r)) ||
+       (ch_update_mask_i[3] && (ch3_code_i != last_ch3_code_r)) ||
+       (ch_update_mask_i[4] && (ch4_code_i != last_ch4_code_r)) ||
+       (ch_update_mask_i[5] && (ch5_code_i != last_ch5_code_r)) ||
+       (ch_update_mask_i[6] && (ch6_code_i != last_ch6_code_r)) ||
+       (ch_update_mask_i[7] && (ch7_code_i != last_ch7_code_r)) ||
+       (muxout_sel_i != last_muxout_sel_r);
+frame_update_req_w değişmeyecek:
+assign frame_update_req_w =
+       frame_vld_i && init_done_r && frame_input_changed_w;
+4. S_IDLE snapshot’ına ekle
+Mevcut 32-clock bekleme tamamlandığında kanal değerleriyle beraber MUX seçimini de al:
+active_muxout_sel_r <= muxout_sel_i;
+Yani snapshot bölümünde:
+active_update_mask_r <= ch_update_mask_i;
+active_muxout_sel_r   <= muxout_sel_i;
+
+active_ch0_code_r     <= ch0_code_i;
+...
+active_ch7_code_r     <= ch7_code_i;
+Bu sayede MUX input’u SPI işlemi sırasında değişse bile o frame’in seçimi sabit kalır.
+5. Yeni bir state ekle
+STATE_WIDTH değerini 18’den 19’a çıkar:
+localparam STATE_WIDTH = 19;
+Yeni state:
+S_FRAME_MUX_UPDATE = 19'd262144; //!19-Apply runtime MUXOUT selection
+Mevcut state sabitlerinin genişliklerini de 19'd... yapabilirsin. Sayısal değerleri değiştirmen gerekmiyor.
+6. S_FRAME_CAPTURE başını değiştir
+Önce MUX değişimi kontrol edilsin:
+S_FRAME_CAPTURE: begin
+    // Apply the captured MUXOUT selection before channel updates.
+    if (active_muxout_sel_r != last_muxout_sel_r) begin
+        state <= S_FRAME_MUX_UPDATE;
+    end else if (active_update_mask_r == 8'h00) begin
+        active_frame_vld_r <= 1'b0;
+        frame_done_r       <= 1'b1;
+
+        last_update_mask_r <= active_update_mask_r;
+        last_ch0_code_r    <= active_ch0_code_r;
+        last_ch1_code_r    <= active_ch1_code_r;
+        last_ch2_code_r    <= active_ch2_code_r;
+        last_ch3_code_r    <= active_ch3_code_r;
+        last_ch4_code_r    <= active_ch4_code_r;
+        last_ch5_code_r    <= active_ch5_code_r;
+        last_ch6_code_r    <= active_ch6_code_r;
+        last_ch7_code_r    <= active_ch7_code_r;
+
+        state <= S_IDLE;
+    end else begin
+        ch_cntr_r <= 0;
+        state     <= S_FRAME_WRITE_CODE;
+    end
+end
+7. Runtime MUX state’ini ekle
+S_FRAME_MUX_UPDATE: begin
+    // Send the captured runtime MUXOUT selection.
+    if (!spi_wait_r && !spi_busy_w) begin
+        spi_tx_data_r <=
+            ltc2666_word(
+                CMD_ANALOG_MUX,
+                4'h0,
+                {11'b0, active_muxout_sel_r}
+            );
+
+        spi_current_tx_data_r <=
+            ltc2666_word(
+                CMD_ANALOG_MUX,
+                4'h0,
+                {11'b0, active_muxout_sel_r}
+            );
+
+        spi_en_r   <= 1'b1;
+        spi_wait_r <= 1'b1;
+
+    end else if (spi_data_valid_w) begin
+        spi_wait_r <= 1'b0;
+
+        if (spi_echo_err_w) begin
+            run_rb_err_r <= 1'b1;
+            init_done_r  <= 1'b0;
+            state        <= S_RECONFIG;
+        end else if (active_update_mask_r == 8'h00) begin
+            // The following NOP verifies the MUX command echo.
+            state <= S_FRAME_ECHO_FLUSH;
+        end else begin
+            // The first channel command will verify the MUX command echo.
+            ch_cntr_r <= 0;
+            state     <= S_FRAME_WRITE_CODE;
+        end
+    end
+end
+Burada echo zinciri korunuyor:
+MUX command gönderilir
+→ gelen echo önceki komuta aittir
+
+CH0 komutu gönderilir
+→ gelen echo MUX command’a aittir
+→ MUX command doğrulanır
+Mask sıfırsa S_FRAME_ECHO_FLUSH NOP göndererek MUX komutunu doğrular.
+8. Başarılı frame sonunda MUX değerini kaydet
+S_FRAME_ECHO_FLUSH başarılı olduğunda şunu ekle:
+last_muxout_sel_r <= active_muxout_sel_r;
+Kanal last_* güncellemeleriyle beraber:
+last_update_mask_r <= active_update_mask_r;
+last_muxout_sel_r   <= active_muxout_sel_r;
+
+last_ch0_code_r     <= active_ch0_code_r;
+...
+last_ch7_code_r     <= active_ch7_code_r;
+9. Busy çıkışına yeni state’i ekle
+assign frame_busy_o =
+       (state == S_FRAME_CAPTURE)    ||
+       (state == S_FRAME_MUX_UPDATE) ||
+       (state == S_FRAME_WRITE_CODE) ||
+       (state == S_FRAME_UPDATE)     ||
+       (state == S_FRAME_PWRUP_WAIT) ||
+       (state == S_FRAME_ECHO_FLUSH);
+Son davranış
+Top seviyede:
+.frame_vld_i      (1'b1),
+.ch_update_mask_i (8'hFF),
+.muxout_sel_i     (muxout_sel),
+olur.
+MUX seçimi açılışta hazır olmak zorunda kalmaz:
+Init tamamlanır, MUXOUT Disabled/Hi-Z kalır.
+Üst modül daha sonra muxout_sel_i değerini hazırlar.
+Controller değişimi algılar.
+32 clock bekler.
+MUXOUT selection komutunu runtime’da gönderir.
+MUX değiştiğinde mask 8'hFF olduğu için sekiz kanal da tekrar yazılır. 5 MHz SPI’de bunun süresi küçük; mevcut çalışan frame/echo yapısını bozmadan yapılan en güvenli ve sade değişiklik bu olur.
