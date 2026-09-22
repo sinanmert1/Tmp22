@@ -1,0 +1,293 @@
+--- /mnt/data/ltc2666_controller_v1_6.v	2026-09-22 06:17:22.118314664 +0000
++++ /mnt/data/ltc2666_controller_v1_7.v	2026-09-22 06:26:04.887498202 +0000
+@@ -18,6 +18,7 @@
+ // 1.4          29.06.2026   Sinan MERT    Runtime update is change-detect based; frame_vld_i is used as update enable.
+ // 1.5          09.07.2026   Sinan MERT    FRAME_CAPTURE_DELAY_CC added. MUXOUT_INIT_SEL parameter changed to as an input and its enable function removed.
+ // 1.6          24.07.2026   Sinan MERT    "muxout_init_sel_i" applies the changes at runtime.
++// 1.7          22.09.2026   Sinan MERT    Runtime MUXOUT path separated from channel frames; OVRTMP recovery and FAULT_HOLD CLR handling updated.
+ //
+ // MODULE DESCRIPTION:
+ // *******************
+@@ -29,7 +30,7 @@
+ // 6- Therefore, all configuration and runtime transactions are verified by SPI echo readback.
+ // 7- There is no direct register readback mechanism like an ADC configuration register map;
+ //    the safety check in this controller is based on the LTC2666 echo readback pipeline.
+-// 8- Internal reference mode is fixed in this controller. External reference selection is not supported.
++// 8- Internal/external reference mode is selected by EXTERNAL_REF_EN.
+ // 9- TGP/toggle and LDAC functions are not controlled by this module. They shall be handled by hardware
+ //    connections according to the schematic and the LTC2666 datasheet recommendations.
+ // 10- CLR is controlled by the FPGA. A low pulse is generated during initialization/reconfiguration.
+@@ -70,12 +71,9 @@
+ // 2- MUXOUT is not a digital FPGA input/output function. It is an analog monitor output pin.
+ // 3- This controller only selects which internal analog signal is routed to the MUXOUT pin.
+ // 4- The selected MUXOUT signal must be measured externally, for example by an ADC input or test point.
+-// 5- MUXOUT_INIT_EN parameter meaning:
+-//      1'b0 : The controller does not send the Analog Mux command during initialization.
+-//             MUXOUT remains in the LTC2666 power-up default state: Disabled / Hi-Z.
+-//      1'b1 : The controller sends one Analog Mux command during initialization and writes
+-//             MUXOUT_INIT_SEL[4:0] into the LTC2666 mux control field M4..M0.
+-// 6- MUXOUT_INIT_SEL parameter meaning when MUXOUT_INIT_EN = 1'b1:
++// 5- muxout_init_sel_i is applied once during initialization and monitored for changes at runtime.
++// 6- Runtime MUXOUT updates use a dedicated state path and do not capture or write DAC channel codes.
++// 7- muxout_init_sel_i coding:
+ //      5'b00000 : Disabled / Hi-Z
+ //      5'b10000 : VOUT0
+ //      5'b10001 : VOUT1
+@@ -90,10 +88,6 @@
+ //      5'b11010 : Temperature Monitor
+ //      5'b11011 : V+
+ //      5'b11100 : V-
+-// 7- Example usage:
+-//      .MUXOUT_INIT_EN  (1'b0),     // MUXOUT disabled, no mux command is sent
+-//      .MUXOUT_INIT_EN  (1'b1),
+-//      .MUXOUT_INIT_SEL (5'b10000)  // route VOUT0 to MUXOUT during initialization
+ // 8- The mux is intended for high-impedance monitoring inputs only.
+ // *******************
+ // ECHO FLUSH STATE:
+@@ -266,6 +260,8 @@
+     wire                        spi_echo_err_w;
+     wire                        frame_input_changed_w;
+     wire                        frame_update_req_w;
++    wire                        muxout_input_changed_w;
++    wire                        muxout_update_req_w;
+ 
+     // // main process counters
+     reg [31:0]                  timer_cntr_r;
+@@ -422,34 +418,36 @@
+            (ch_update_mask_i[4] && (ch4_code_i != last_ch4_code_r)) ||
+            (ch_update_mask_i[5] && (ch5_code_i != last_ch5_code_r)) ||
+            (ch_update_mask_i[6] && (ch6_code_i != last_ch6_code_r)) ||
+-           (ch_update_mask_i[7] && (ch7_code_i != last_ch7_code_r)) ||
+-           (muxout_init_sel_i != last_muxout_sel_r);
++           (ch_update_mask_i[7] && (ch7_code_i != last_ch7_code_r));
+ 
+-    assign frame_update_req_w = frame_vld_i && init_done_r && frame_input_changed_w;
++    assign frame_update_req_w    = frame_vld_i && init_done_r && frame_input_changed_w;
++    assign muxout_input_changed_w = (muxout_init_sel_i != last_muxout_sel_r);
++    assign muxout_update_req_w    = init_done_r && muxout_input_changed_w;
+ 
+     //#############################################################################
+     //                               STATE MACHINE
+     //#############################################################################
+-    localparam STATE_WIDTH = 19;
+-    localparam [STATE_WIDTH-1:0] S_CLR              = 19'd1,      //!1-Clear DAC
+-                                   S_WAKEUP           = 19'd2,      //!2-Wait after clear
+-                                   S_INIT_NOP         = 19'd4,      //!3-Initialize echo pipeline
+-                                   S_INIT_CONFIG      = 19'd8,      //!4-Configure internal reference usage and thermal shutdown
+-                                   S_INIT_MUX         = 19'd16,     //!5-Configure MUXOUT if enabled
+-                                   S_INIT_SPAN        = 19'd32,     //!6-Configure channel SoftSpan values
+-                                   S_INIT_CODE        = 19'd64,     //!7-Write channel init codes
+-                                   S_INIT_UPDATE_ALL  = 19'd128,    //!8-Update all DAC outputs after init code/span writes
+-                                   S_INIT_POWER_DOWN  = 19'd256,    //!9-Apply optional init-time power-down commands
+-                                   S_INIT_ECHO_FLUSH  = 19'd512,    //!10-Flush echo pipeline after last init command
+-                                   S_IDLE             = 19'd1024,   //!11-Wait for input code/mask change
+-                                   S_FRAME_CAPTURE    = 19'd2048,   //!12-Start captured active frame
+-                                   S_FRAME_WRITE_CODE = 19'd4096,   //!13-Write selected channel codes
+-                                   S_FRAME_UPDATE     = 19'd8192,   //!14-Update All in synchronized frame mode
+-                                   S_FRAME_PWRUP_WAIT = 19'd16384,  //!15-Wait after waking up a powered-down channel/chip
+-                                   S_FRAME_ECHO_FLUSH = 19'd32768,  //!16-Flush echo pipeline after last frame command
+-                                   S_RECONFIG         = 19'd65536,  //!17-Reconfiguration control and optional retry limiting
+-                                   S_FAULT_HOLD       = 19'd131072, //!18-Fault hold after retry limit is reached
+-                                   S_FRAME_MUX_UPDATE = 19'd262144; //!19-Apply runtime MUXOUT selection
++    localparam STATE_WIDTH = 20;
++    localparam [STATE_WIDTH-1:0] S_CLR              = 20'd1,      //!1-Clear DAC
++                                   S_WAKEUP           = 20'd2,      //!2-Wait after clear
++                                   S_INIT_NOP         = 20'd4,      //!3-Initialize echo pipeline
++                                   S_INIT_CONFIG      = 20'd8,      //!4-Configure reference usage and thermal shutdown
++                                   S_INIT_MUX         = 20'd16,     //!5-Configure MUXOUT during initialization
++                                   S_INIT_SPAN        = 20'd32,     //!6-Configure channel SoftSpan values
++                                   S_INIT_CODE        = 20'd64,     //!7-Write channel init codes
++                                   S_INIT_UPDATE_ALL  = 20'd128,    //!8-Update all DAC outputs after init code/span writes
++                                   S_INIT_POWER_DOWN  = 20'd256,    //!9-Apply optional init-time power-down commands
++                                   S_INIT_ECHO_FLUSH  = 20'd512,    //!10-Flush echo pipeline after last init command
++                                   S_IDLE             = 20'd1024,   //!11-Wait for channel or MUXOUT change
++                                   S_FRAME_CAPTURE    = 20'd2048,   //!12-Start captured active channel frame
++                                   S_FRAME_WRITE_CODE = 20'd4096,   //!13-Write selected channel codes
++                                   S_FRAME_UPDATE     = 20'd8192,   //!14-Update All in synchronized frame mode
++                                   S_FRAME_PWRUP_WAIT = 20'd16384,  //!15-Wait after waking up a powered-down channel/chip
++                                   S_FRAME_ECHO_FLUSH = 20'd32768,  //!16-Flush echo pipeline after last channel frame command
++                                   S_RECONFIG         = 20'd65536,  //!17-Reconfiguration control and optional retry limiting
++                                   S_FAULT_HOLD       = 20'd131072, //!18-Fault hold after retry limit is reached
++                                   S_MUX_UPDATE       = 20'd262144, //!19-Apply runtime MUXOUT selection
++                                   S_MUX_ECHO_FLUSH   = 20'd524288; //!20-Verify runtime MUXOUT command echo
+ 
+     reg [STATE_WIDTH-1:0] state /* synthesis syn_encoding = "safe,onehot" */;
+ 
+@@ -591,7 +589,9 @@
+                         // Optional init-time MUXOUT configuration. MUXOUT_INIT_SEL input source to MUXOUT.
+                         // muxout_init_sel_i = 5'b00000: disables MUXOUT / Hi-Z
+                         if (!spi_wait_r && !spi_busy_w) begin
+-                            spi_tx_data_r         <= ltc2666_word(CMD_ANALOG_MUX, 4'h0, {11'b0, muxout_init_sel_i}); // Mux command data[4:0] = MUXOUT_INIT_SEL
++                            // Capture the exact MUXOUT selection applied during initialization.
++                            active_muxout_sel_r   <= muxout_init_sel_i;
++                            spi_tx_data_r         <= ltc2666_word(CMD_ANALOG_MUX, 4'h0, {11'b0, muxout_init_sel_i});
+                             spi_current_tx_data_r <= ltc2666_word(CMD_ANALOG_MUX, 4'h0, {11'b0, muxout_init_sel_i});
+                             spi_en_r              <= 1'b1;
+                             spi_wait_r            <= 1'b1;
+@@ -757,6 +757,20 @@
+                                 frame_overrun_err_r   <= 1'b0;
+                                 init_done_r           <= 1'b1;
+                                 cfg_retry_cntr_r      <= 0;
++
++                                // After CLR/re-initialization, make the change detector reflect
++                                // the actual values that were just applied to the DAC.
++                                last_update_mask_r    <= 8'hFF;
++                                last_ch0_code_r       <= CH0_INIT_CODE;
++                                last_ch1_code_r       <= CH1_INIT_CODE;
++                                last_ch2_code_r       <= CH2_INIT_CODE;
++                                last_ch3_code_r       <= CH3_INIT_CODE;
++                                last_ch4_code_r       <= CH4_INIT_CODE;
++                                last_ch5_code_r       <= CH5_INIT_CODE;
++                                last_ch6_code_r       <= CH6_INIT_CODE;
++                                last_ch7_code_r       <= CH7_INIT_CODE;
++                                last_muxout_sel_r     <= active_muxout_sel_r;
++
+                                 state                 <= S_IDLE;
+                             end
+                         end
+@@ -764,12 +778,21 @@
+ 
+                     S_IDLE: begin
+                         if (!ovrtmp_al_i) begin
+-                            ovrtmp_err_r              <= 1'b1;
+-                            init_done_r               <= 1'b0;
++                            ovrtmp_err_r               <= 1'b1;
++                            init_done_r                <= 1'b0;
++                            frame_capture_delay_cntr_r <= 0;
++                            state                      <= S_RECONFIG;
++
++                        end else if (muxout_update_req_w) begin
++                            // Runtime MUXOUT updates are independent from DAC channel frames.
++                            // Do not capture or rewrite channel data when only MUXOUT changes.
+                             frame_capture_delay_cntr_r <= 0;
+-                            state                     <= S_RECONFIG;
++                            active_muxout_sel_r        <= muxout_init_sel_i;
++                            state                      <= S_MUX_UPDATE;
++
+                         end else if (frame_update_req_w) begin
+-                            if (frame_capture_delay_cntr_r == FRAME_CAPTURE_DELAY_CC - 1) begin // Capture the latest input values after a short settle window.
++                            if (frame_capture_delay_cntr_r == FRAME_CAPTURE_DELAY_CC - 1) begin
++                                // Capture channel inputs only after the settle window.
+                                 frame_capture_delay_cntr_r <= 0;
+                                 active_frame_vld_r         <= 1'b1;
+                                 active_update_mask_r       <= ch_update_mask_i;
+@@ -781,7 +804,6 @@
+                                 active_ch5_code_r          <= ch5_code_i;
+                                 active_ch6_code_r          <= ch6_code_i;
+                                 active_ch7_code_r          <= ch7_code_i;
+-                                active_muxout_sel_r        <= muxout_init_sel_i;
+                                 ch_cntr_r                  <= 0;
+                                 state                      <= S_FRAME_CAPTURE;
+                             end else begin
+@@ -793,13 +815,9 @@
+                     end
+ 
+                     S_FRAME_CAPTURE: begin
+-                        // Apply the captured MUXOUT selection before channel updates.
+-                        if (active_muxout_sel_r != last_muxout_sel_r) begin
+-                            state <= S_FRAME_MUX_UPDATE;
+-                        end else if (active_update_mask_r == 8'h00) begin
+-                            // Active frame was captured in S_IDLE.
+-                            // If the mask is zero, no DAC transaction is needed, but the last-applied
+-                            // frame information is updated to prevent repeated zero-mask updates.
++                        // Channel-frame path only. Runtime MUXOUT is handled separately.
++                        if (active_update_mask_r == 8'h00) begin
++                            // No channel transaction is required for a zero mask.
+                             active_frame_vld_r <= 1'b0;
+                             frame_done_r       <= 1'b1;
+                             last_update_mask_r <= active_update_mask_r;
+@@ -818,8 +836,8 @@
+                         end
+                     end
+ 
+-                    S_FRAME_MUX_UPDATE: begin
+-                        // Send the captured runtime MUXOUT selection.
++                    S_MUX_UPDATE: begin
++                        // Send only the captured runtime MUXOUT selection.
+                         if (!spi_wait_r && !spi_busy_w) begin
+                             spi_tx_data_r         <= ltc2666_word(CMD_ANALOG_MUX, 4'h0, {11'b0, active_muxout_sel_r});
+                             spi_current_tx_data_r <= ltc2666_word(CMD_ANALOG_MUX, 4'h0, {11'b0, active_muxout_sel_r});
+@@ -827,15 +845,35 @@
+                             spi_wait_r            <= 1'b1;
+                         end else if (spi_data_valid_w) begin
+                             spi_wait_r <= 1'b0;
+-                            if (spi_echo_err_w) begin
+-                                run_rb_err_r <= 1'b1;
++                            if (spi_echo_err_w || !ovrtmp_al_i) begin
++                                run_rb_err_r <= spi_echo_err_w;
++                                ovrtmp_err_r <= !ovrtmp_al_i;
+                                 init_done_r  <= 1'b0;
+                                 state        <= S_RECONFIG;
+-                            end else if (active_update_mask_r == 8'h00) begin // The following NOP verifies the MUX Cmd echo
+-                                state <= S_FRAME_ECHO_FLUSH;
+-                            end else begin // The first channel command will verify the MUX cmd echo
+-                                ch_cntr_r <= 0;
+-                                state     <= S_FRAME_WRITE_CODE;
++                            end else begin
++                                // A dedicated NOP transaction verifies the MUX command echo.
++                                state <= S_MUX_ECHO_FLUSH;
++                            end
++                        end
++                    end
++
++                    S_MUX_ECHO_FLUSH: begin
++                        // Verify the runtime MUXOUT command without touching channel state.
++                        if (!spi_wait_r && !spi_busy_w) begin
++                            spi_tx_data_r         <= ltc2666_word(CMD_NOP, 4'h0, 16'h0000);
++                            spi_current_tx_data_r <= ltc2666_word(CMD_NOP, 4'h0, 16'h0000);
++                            spi_en_r              <= 1'b1;
++                            spi_wait_r            <= 1'b1;
++                        end else if (spi_data_valid_w) begin
++                            spi_wait_r <= 1'b0;
++                            if (spi_echo_err_w || !ovrtmp_al_i) begin
++                                run_rb_err_r <= spi_echo_err_w;
++                                ovrtmp_err_r <= !ovrtmp_al_i;
++                                init_done_r  <= 1'b0;
++                                state        <= S_RECONFIG;
++                            end else begin
++                                last_muxout_sel_r <= active_muxout_sel_r;
++                                state             <= S_IDLE;
+                             end
+                         end
+                     end
+@@ -954,7 +992,6 @@
+                                 last_ch5_code_r    <= active_ch5_code_r;
+                                 last_ch6_code_r    <= active_ch6_code_r;
+                                 last_ch7_code_r    <= active_ch7_code_r;
+-                                last_muxout_sel_r  <= active_muxout_sel_r;
+                                 state              <= S_IDLE;
+                             end
+                         end
+@@ -971,8 +1008,10 @@
+                         clr_al_r              <= 1'b1;
+                         frame_capture_delay_cntr_r <= 0;
+                         if (!ovrtmp_al_i) begin
++                            // Do not wait for OVRTMP to release here. Restart the full DAC init
++                            // sequence so CLR and subsequent CS/LD activity can occur.
+                             ovrtmp_err_r <= 1'b1;
+-                            state        <= S_RECONFIG;
++                            state        <= S_CLR;
+                         end else if (CFG_RETRY_FOREVER_EN == 1'b1) begin
+                             state <= S_CLR;
+                         end else if (cfg_retry_cntr_r < CFG_RETRY_MAX) begin
+@@ -991,7 +1030,7 @@
+                         active_frame_vld_r  <= 1'b0;
+                         spi_en_r            <= 1'b0;
+                         spi_wait_r          <= 1'b0;
+-                        clr_al_r            <= 1'b1;
++                        clr_al_r            <= 1'b0;
+                         state               <= S_FAULT_HOLD;
+                     end
+ 
+@@ -1011,8 +1050,9 @@
+     assign cfg_rb_err_o          = cfg_rb_err_r;
+     assign run_rb_err_o          = run_rb_err_r;
+     assign ovrtmp_err_o          = ovrtmp_err_r;
+-    assign frame_busy_o          = (state == S_FRAME_CAPTURE) || (state == S_FRAME_MUX_UPDATE) || (state == S_FRAME_WRITE_CODE) || (state == S_FRAME_UPDATE) ||
+-                                   (state == S_FRAME_PWRUP_WAIT) || (state == S_FRAME_ECHO_FLUSH);
++    assign frame_busy_o          = (state == S_FRAME_CAPTURE) || (state == S_FRAME_WRITE_CODE) || (state == S_FRAME_UPDATE) ||
++                                   (state == S_FRAME_PWRUP_WAIT) || (state == S_FRAME_ECHO_FLUSH) ||
++                                   (state == S_MUX_UPDATE) || (state == S_MUX_ECHO_FLUSH);
+     assign frame_done_o          = frame_done_r;
+     assign frame_overrun_err_o   = 1'b0;
+     assign fault_o               = cfg_rb_err_r || run_rb_err_r || ovrtmp_err_r;
